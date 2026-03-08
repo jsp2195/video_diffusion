@@ -111,24 +111,39 @@ class KineticsVideoDataset(Dataset):
         img = img.crop((left, top, left + self.size, top + self.size))
         return np.array(img)
 
-    def __getitem__(self, idx: int):
-        path = self.files[idx]
-        vr = self._get_reader(path)
-        n, fps = self._get_meta(path, vr)
-        if n <= 0:
-            raise RuntimeError(f"Empty video: {path}")
+    def __getitem__(self, idx):
+        while True:
+            path = self.files[idx]
 
-        frame_idx = self._sample_indices(n, fps)
-        frames = vr.get_batch(frame_idx).asnumpy()  # [T,H,W,3]
+            try:
+                vr = self._get_reader(path)
+                n, fps = self._get_meta(path, vr)
 
-        proc = []
-        for i in range(frames.shape[0]):
-            f = self._resize_crop(frames[i])
-            gray = _to_gray(f)
-            gray = (gray / 127.5) - 1.0
-            proc.append(gray.astype(np.float32))
+                if n < self.num_frames:
+                    idx = (idx + 1) % len(self.files)
+                    continue
 
-        clip = np.stack(proc, axis=0)  # [T,H,W]
-        clip = torch.from_numpy(clip).unsqueeze(0)  # [1,T,H,W]
-        cond = clip[:, 0]  # [1,H,W]
-        return {"cond": cond, "clip": clip, "path": path}
+                indices = self._sample_indices(n, fps)
+                frames = vr.get_batch(indices).asnumpy()  # [T,H,W,3]
+
+                processed = []
+                for f in frames:
+                    f = self._resize_crop(f)
+                    gray = _to_gray(f)
+                    processed.append(gray)
+
+                frames = np.stack(processed)  # [T,H,W]
+
+                frames = torch.from_numpy(frames).unsqueeze(0).float() / 127.5 - 1
+                # [1,T,H,W]
+
+                cond = frames[:, 0]  # [1,H,W]
+                clip = frames        # [1,T,H,W]
+
+                return {
+                    "cond": cond,
+                    "clip": clip,
+                }
+
+            except Exception:
+                idx = (idx + 1) % len(self.files)
