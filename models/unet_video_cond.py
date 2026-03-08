@@ -45,10 +45,8 @@ class VideoStage(nn.Module):
 
 
 class VideoUNetConditional(nn.Module):
-    def __init__(self, in_channels: int = 1, base_channels: int = 64):
+    def __init__(self, in_channels: int = 1, base_channels: int = 32):
         super().__init__()
-        self.in_channels = in_channels
-        self.base_channels = base_channels
         time_dim = base_channels * 4
 
         self.time_mlp = nn.Sequential(
@@ -58,35 +56,37 @@ class VideoUNetConditional(nn.Module):
             nn.Linear(time_dim, time_dim),
         )
 
-        # concat x_t and repeated cond frame => 2 channels
-        self.in_conv = nn.Conv3d(in_channels + 1, base_channels, kernel_size=3, padding=1)
+        # x_t + conditioning frame
+        self.in_conv = nn.Conv3d(in_channels + 1, base_channels, 3, padding=1)
 
-        self.down1 = VideoStage(base_channels, 64, time_dim)
-        self.down2 = VideoStage(64, 128, time_dim)
-        self.down3 = VideoStage(128, 256, time_dim)
-        self.down4 = VideoStage(256, 512, time_dim)
+        # Encoder
+        self.down1 = VideoStage(base_channels, base_channels, time_dim)
+        self.down2 = VideoStage(base_channels * 2, base_channels * 2, time_dim)
+        self.down3 = VideoStage(base_channels * 4, base_channels * 4, time_dim)
+        self.down4 = VideoStage(base_channels * 8, base_channels * 8, time_dim)
 
-        self.ds1 = nn.Conv3d(64, 128, kernel_size=(1, 4, 4), stride=(1, 2, 2), padding=(0, 1, 1))
-        self.ds2 = nn.Conv3d(128, 256, kernel_size=(1, 4, 4), stride=(1, 2, 2), padding=(0, 1, 1))
-        self.ds3 = nn.Conv3d(256, 512, kernel_size=(1, 4, 4), stride=(1, 2, 2), padding=(0, 1, 1))
+        self.ds1 = nn.Conv3d(base_channels, base_channels * 2, (1,4,4), stride=(1,2,2), padding=(0,1,1))
+        self.ds2 = nn.Conv3d(base_channels * 2, base_channels * 4, (1,4,4), stride=(1,2,2), padding=(0,1,1))
+        self.ds3 = nn.Conv3d(base_channels * 4, base_channels * 8, (1,4,4), stride=(1,2,2), padding=(0,1,1))
 
-        self.mid = VideoStage(512, 512, time_dim)
+        # Bottleneck
+        self.mid = VideoStage(base_channels * 8, base_channels * 8, time_dim)
 
-        self.us1 = nn.ConvTranspose3d(512, 256, kernel_size=(1, 4, 4), stride=(1, 2, 2), padding=(0, 1, 1))
-        self.up1 = VideoStage(256 + 256, 256, time_dim)
+        # Decoder
+        self.us1 = nn.ConvTranspose3d(base_channels * 8, base_channels * 4, (1,4,4), stride=(1,2,2), padding=(0,1,1))
+        self.up1 = VideoStage(base_channels * 8, base_channels * 4, time_dim)
 
-        self.us2 = nn.ConvTranspose3d(256, 128, kernel_size=(1, 4, 4), stride=(1, 2, 2), padding=(0, 1, 1))
-        self.up2 = VideoStage(128 + 128, 128, time_dim)
+        self.us2 = nn.ConvTranspose3d(base_channels * 4, base_channels * 2, (1,4,4), stride=(1,2,2), padding=(0,1,1))
+        self.up2 = VideoStage(base_channels * 4, base_channels * 2, time_dim)
 
-        self.us3 = nn.ConvTranspose3d(128, 64, kernel_size=(1, 4, 4), stride=(1, 2, 2), padding=(0, 1, 1))
-        self.up3 = VideoStage(64 + 64, 64, time_dim)
+        self.us3 = nn.ConvTranspose3d(base_channels * 2, base_channels, (1,4,4), stride=(1,2,2), padding=(0,1,1))
+        self.up3 = VideoStage(base_channels * 2, base_channels, time_dim)
 
-        self.out_norm = nn.GroupNorm(32, 64)
+        self.out_norm = nn.GroupNorm(32, base_channels)
         self.out_act = nn.SiLU()
-        self.out_conv = nn.Conv3d(64, in_channels, kernel_size=3, padding=1)
+        self.out_conv = nn.Conv3d(base_channels, in_channels, 3, padding=1)
 
     def forward(self, x_t: torch.Tensor, timestep: torch.Tensor, cond_first_frame: torch.Tensor) -> torch.Tensor:
-        # x_t: [B,1,T,H,W], cond_first_frame: [B,1,H,W]
         b, _, t, h, w = x_t.shape
         t_emb = self.time_mlp(timestep)
 

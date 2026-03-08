@@ -145,7 +145,7 @@ def train(args):
         drop_last=False,
     )
 
-    model = VideoUNetConditional(in_channels=1, base_channels=64).to(device)
+    model = VideoUNetConditional(in_channels=1, base_channels=32).to(device)
     if distributed:
         model = DDP(model, device_ids=[local_rank] if torch.cuda.is_available() else None, output_device=local_rank if torch.cuda.is_available() else None, find_unused_parameters=False)
 
