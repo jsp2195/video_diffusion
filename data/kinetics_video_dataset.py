@@ -112,7 +112,8 @@ class KineticsVideoDataset(Dataset):
         return np.array(img)
 
     def __getitem__(self, idx):
-        while True:
+        attempts = 0
+        while attempts < len(self.files):
             path = self.files[idx]
 
             try:
@@ -146,4 +147,7 @@ class KineticsVideoDataset(Dataset):
                 }
 
             except Exception:
+                attempts += 1
                 idx = (idx + 1) % len(self.files)
+
+        raise RuntimeError("No valid videos could be decoded from dataset")

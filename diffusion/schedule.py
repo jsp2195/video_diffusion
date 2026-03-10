@@ -16,9 +16,17 @@ def cosine_beta_schedule(timesteps: int, s: float = 0.008) -> torch.Tensor:
 @dataclass
 class DiffusionSchedule:
     timesteps: int
+    schedule: str = "cosine"
 
     def __post_init__(self):
-        self.betas = cosine_beta_schedule(self.timesteps)
+        if self.schedule == "cosine":
+            betas = cosine_beta_schedule(self.timesteps)
+        elif self.schedule == "linear":
+            betas = torch.linspace(1e-4, 0.02, self.timesteps)
+        else:
+            raise ValueError("Unknown beta schedule")
+
+        self.betas = betas
         self.alphas = 1.0 - self.betas
         self.alpha_bar = torch.cumprod(self.alphas, dim=0)
         self.alpha_bar_prev = torch.cat([torch.tensor([1.0], dtype=torch.float32), self.alpha_bar[:-1]], dim=0)

@@ -145,12 +145,18 @@ def train(args):
         drop_last=False,
     )
 
+    if len(train_loader) == 0:
+        raise RuntimeError("Training loader is empty. Dataset too small or batch_size too large.")
+
+    if len(val_loader) == 0:
+        raise RuntimeError("Validation loader is empty.")
+
     model = VideoUNetConditional(in_channels=1, base_channels=32).to(device)
     if distributed:
         model = DDP(model, device_ids=[local_rank] if torch.cuda.is_available() else None, output_device=local_rank if torch.cuda.is_available() else None, find_unused_parameters=False)
 
     ema = EMA(unwrap_model(model), decay=args.ema_decay, update_after_step=1000)
-    diffusion = DiffusionSchedule(timesteps=args.timesteps).to(device)
+    diffusion = DiffusionSchedule(args.timesteps, schedule=args.beta_schedule).to(device)
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, len(train_loader) * args.epochs))
@@ -175,6 +181,8 @@ def train(args):
         for batch in train_loader:
             cond = batch["cond"].to(device, non_blocking=True)
             clip = batch["clip"].to(device, non_blocking=True)
+            assert clip.ndim == 5
+            assert cond.ndim == 4
 
             if args.cfg_drop_prob > 0:
                 mask = (torch.rand(cond.shape[0], device=device) < args.cfg_drop_prob).float().view(-1, 1, 1, 1)
@@ -264,8 +272,9 @@ def train(args):
             if (epoch + 1) % args.vis_every == 0 and fixed_idx is not None:
                 preview_sample = val_ds[fixed_idx]
                 preview_cond = preview_sample["cond"].unsqueeze(0).to(device)
+                ema_model = ema.ema_model if hasattr(ema, "ema_model") else ema
                 preview_video = sample_video(
-                    ema.ema_model if hasattr(ema, "ema_model") else ema,
+                    ema_model,
                     diffusion,
                     preview_cond,
                     t_len=args.T,

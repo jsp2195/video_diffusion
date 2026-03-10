@@ -28,7 +28,7 @@ def sample(args):
     random.seed(args.seed)
 
     ckpt = torch.load(args.ckpt, map_location=device)
-    model = VideoUNetConditional(in_channels=1, base_channels=64).to(device)
+    model = VideoUNetConditional(in_channels=1, base_channels=32).to(device)
 
     if not args.use_raw_model:
         if "ema_state_dict" in ckpt:
@@ -49,7 +49,7 @@ def sample(args):
         cond = ds[np.random.randint(0, len(ds))]["cond"].unsqueeze(0)
 
     cond = cond.to(device)
-    diffusion = DiffusionSchedule(timesteps=args.timesteps).to(device)
+    diffusion = DiffusionSchedule(args.timesteps, schedule=args.beta_schedule).to(device)
 
     x = torch.randn(1, 1, args.T, args.size, args.size, device=device)
     ddim_times = torch.linspace(args.timesteps - 1, 0, args.ddim_steps, device=device).long()
@@ -66,7 +66,7 @@ def sample(args):
         x = diffusion.ddim_step_from_v(x, v, t, t_prev, eta=args.ddim_eta)
 
     os.makedirs(args.out_dir, exist_ok=True)
-    save_cond_png(cond.unsqueeze(2), os.path.join(args.out_dir, "cond.png"))
+    save_cond_png(cond, os.path.join(args.out_dir, "cond.png"))
     save_mp4(x, os.path.join(args.out_dir, "sample.mp4"), fps=args.fps)
     print(f"saved: {os.path.join(args.out_dir, 'cond.png')}")
     print(f"saved: {os.path.join(args.out_dir, 'sample.mp4')}")
