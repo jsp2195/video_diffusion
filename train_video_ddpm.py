@@ -145,7 +145,7 @@ def train(args):
         drop_last=False,
     )
 
-    model = VideoUNetConditional(in_channels=1, base_channels=32).to(device)
+    model = VideoUNetConditional(in_channels=1, base_channels=64).to(device)
     if distributed:
         model = DDP(model, device_ids=[local_rank] if torch.cuda.is_available() else None, output_device=local_rank if torch.cuda.is_available() else None, find_unused_parameters=False)
 
@@ -308,16 +308,16 @@ def build_parser():
     p.add_argument("--out_dir", type=str, default="outputs/train")
     p.add_argument("--T", type=int, default=16)
     p.add_argument("--size", type=int, default=128)
-    p.add_argument("--batch_size", type=int, default=2)
+    p.add_argument("--batch_size", type=int, default=6)
     p.add_argument("--lr", type=float, default=1e-4)
-    p.add_argument("--epochs", type=int, default=20)
+    p.add_argument("--epochs", type=int, default=80)
     p.add_argument("--timesteps", type=int, default=1000)
     p.add_argument("--beta_schedule", type=str, default="cosine", choices=["cosine", "linear"])
     p.add_argument("--cfg_drop_prob", type=float, default=0.1)
-    p.add_argument("--ema_decay", type=float, default=0.9999)
+    p.add_argument("--ema_decay", type=float, default=0.99995)
     p.add_argument("--save_every", type=int, default=500)
     p.add_argument("--log_every", type=int, default=20)
-    p.add_argument("--num_workers", type=int, default=8)
+    p.add_argument("--num_workers", type=int, default=12)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--max_videos", type=int, default=None)
     p.add_argument("--max_steps", type=int, default=0)
@@ -325,13 +325,13 @@ def build_parser():
     p.add_argument("--amp", action="store_true")
     p.add_argument("--shape_check", action="store_true")
     p.add_argument("--overfit_16", action="store_true")
-    p.add_argument("--vis_every", type=int, default=1)
+    p.add_argument("--vis_every", type=int, default=5)
     p.add_argument("--vis_guidance_scale", type=float, default=1.5)
     p.add_argument("--vis_steps", type=int, default=50)
     p.add_argument("--tensorboard", action="store_true")
     p.add_argument("--log_dir", type=str, default="runs")
     p.add_argument("--eval_fvd_every", type=int, default=0)
-    p.add_argument("--num_eval_videos", type=int, default=8)
+    p.add_argument("--num_eval_videos", type=int, default=32)
     p.add_argument("--cache_videos", action="store_true")
     return p
 
