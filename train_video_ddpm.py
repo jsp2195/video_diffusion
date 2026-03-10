@@ -165,14 +165,34 @@ def train(args):
     logger = TrainLogger(enabled=args.tensorboard and is_main_process(), log_dir=args.log_dir)
 
     os.makedirs(args.out_dir, exist_ok=True)
+    start_epoch = 0
     global_step = 0
+    
+    resume_ckpt = os.path.join(args.out_dir, "last.pt")
+
+    if args.resume and os.path.exists(resume_ckpt):
+        if is_main_process():
+            print(f"Resuming training from {resume_ckpt}")
+
+        ckpt = torch.load(resume_ckpt, map_location=device)
+
+        unwrap_model(model).load_state_dict(ckpt["model_state_dict"])
+        ema.load_state_dict(ckpt["ema_state_dict"])
+        opt.load_state_dict(ckpt["optimizer_state_dict"])
+        sched.load_state_dict(ckpt["scheduler_state_dict"])
+        scaler.load_state_dict(ckpt["scaler_state_dict"])
+
+        global_step = ckpt["step"]
+        start_epoch = ckpt["epoch"]
+    
+
     fixed_rng = random.Random(args.seed)
     fixed_idx = fixed_rng.randrange(len(val_ds)) if len(val_ds) > 0 else None
 
     history = {"train_loss": [], "val_loss": [], "fvd": [], "fvd_epochs": []}
     best_val_loss = float("inf")
 
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         if distributed:
             train_sampler.set_epoch(epoch)
         model.train()
@@ -253,6 +273,7 @@ def train(args):
                 "model_state_dict": model_unwrapped.state_dict(),
                 "ema_state_dict": ema.state_dict(),
                 "optimizer_state_dict": opt.state_dict(),
+                "scheduler_state_dict": sched.state_dict(),
                 "scaler_state_dict": scaler.state_dict(),
                 "step": global_step,
                 "epoch": epoch + 1,
@@ -339,6 +360,7 @@ def build_parser():
     p.add_argument("--eval_fvd_every", type=int, default=0)
     p.add_argument("--num_eval_videos", type=int, default=32)
     p.add_argument("--cache_videos", action="store_true")
+    p.add_argument("--resume", action="store_true")
     return p
 
 
