@@ -145,7 +145,7 @@ def train(args):
         drop_last=False,
     )
 
-    model = VideoUNetConditional(in_channels=1, base_channels=64).to(device)
+    model = VideoUNetConditional(in_channels=1, base_channels=32).to(device)
     if distributed:
         model = DDP(model, device_ids=[local_rank] if torch.cuda.is_available() else None, output_device=local_rank if torch.cuda.is_available() else None, find_unused_parameters=False)
 
@@ -164,6 +164,7 @@ def train(args):
     fixed_idx = fixed_rng.randrange(len(val_ds))
 
     history = {"train_loss": [], "val_loss": [], "fvd": [], "fvd_epochs": []}
+    best_val_loss = float("inf")
 
     for epoch in range(args.epochs):
         if distributed:
@@ -207,18 +208,6 @@ def train(args):
                 logger.add_scalar("train/loss", float(loss.item()), global_step)
                 logger.add_scalar("learning_rate", float(opt.param_groups[0]["lr"]), global_step)
 
-            if global_step % args.save_every == 0 and is_main_process():
-                ckpt = {
-                    "model_state_dict": unwrap_model(model).state_dict(),
-                    "ema_state_dict": ema.state_dict(),
-                    "optimizer_state_dict": opt.state_dict(),
-                    "scaler_state_dict": scaler.state_dict(),
-                    "step": global_step,
-                    "epoch": epoch + 1,
-                    "config": vars(args),
-                }
-                torch.save(ckpt, os.path.join(args.out_dir, f"ckpt_{global_step}.pt"))
-
             if args.max_steps > 0 and global_step >= args.max_steps:
                 break
 
@@ -251,13 +240,32 @@ def train(args):
 
         if is_main_process():
             print(f"epoch={epoch+1} train_loss={train_loss_epoch:.6f} val_loss={val_loss_epoch:.6f}")
+            model_unwrapped = unwrap_model(model)
+            ckpt = {
+                "model_state_dict": model_unwrapped.state_dict(),
+                "ema_state_dict": ema.state_dict(),
+                "optimizer_state_dict": opt.state_dict(),
+                "scaler_state_dict": scaler.state_dict(),
+                "step": global_step,
+                "epoch": epoch + 1,
+                "config": vars(args),
+            }
+
+            # save most recent checkpoint
+            torch.save(ckpt, os.path.join(args.out_dir, "last.pt"))
+
+            # save best checkpoint
+            if val_loss_epoch < best_val_loss:
+                best_val_loss = val_loss_epoch
+                torch.save(ckpt, os.path.join(args.out_dir, "best.pt"))
+            
             logger.add_scalar("val/loss", val_loss_epoch, epoch + 1)
 
             if (epoch + 1) % args.vis_every == 0:
                 preview_sample = val_ds[fixed_idx]
                 preview_cond = preview_sample["cond"].unsqueeze(0).to(device)
                 preview_video = sample_video(
-                    ema.ema_model,
+                    ema.ema_model if hasattr(ema, "ema_model") else ema,
                     diffusion,
                     preview_cond,
                     t_len=args.T,
@@ -267,11 +275,12 @@ def train(args):
                     eta=0.0,
                 )
                 preview_path = os.path.join(args.out_dir, f"epoch_{epoch+1:04d}_sample.mp4")
-                save_mp4(preview_video, preview_path, fps=8)
+                save_mp4(preview_video[0], preview_path, fps=8)
                 logger.add_video("preview/video", ((preview_video.clamp(-1, 1) + 1.0) / 2.0).permute(0, 2, 1, 3, 4), epoch + 1, fps=8)
 
             if args.eval_fvd_every > 0 and (epoch + 1) % args.eval_fvd_every == 0:
-                fvd_score = evaluate_fvd(ema.ema_model, diffusion, val_ds, args, device)
+                ema_model = ema.ema_model if hasattr(ema, "ema_model") else ema
+                fvd_score = evaluate_fvd(ema_model, diffusion, val_ds, args, device)
                 history["fvd"].append(fvd_score)
                 history["fvd_epochs"].append(epoch + 1)
                 print(f"epoch={epoch+1}, fvd_score={fvd_score:.4f}")
@@ -285,17 +294,6 @@ def train(args):
         if args.max_steps > 0 and global_step >= args.max_steps:
             break
 
-    if is_main_process():
-        final_ckpt = {
-            "model_state_dict": unwrap_model(model).state_dict(),
-            "ema_state_dict": ema.state_dict(),
-            "optimizer_state_dict": opt.state_dict(),
-            "scaler_state_dict": scaler.state_dict(),
-            "step": global_step,
-            "epoch": epoch + 1,
-            "config": vars(args),
-        }
-        torch.save(final_ckpt, os.path.join(args.out_dir, "checkpoint.pt"))
 
     logger.close()
     cleanup_distributed()
@@ -315,9 +313,8 @@ def build_parser():
     p.add_argument("--beta_schedule", type=str, default="cosine", choices=["cosine", "linear"])
     p.add_argument("--cfg_drop_prob", type=float, default=0.1)
     p.add_argument("--ema_decay", type=float, default=0.99995)
-    p.add_argument("--save_every", type=int, default=500)
     p.add_argument("--log_every", type=int, default=20)
-    p.add_argument("--num_workers", type=int, default=12)
+    p.add_argument("--num_workers", type=int, default=8)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--max_videos", type=int, default=None)
     p.add_argument("--max_steps", type=int, default=0)
