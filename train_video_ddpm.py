@@ -161,7 +161,7 @@ def train(args):
     os.makedirs(args.out_dir, exist_ok=True)
     global_step = 0
     fixed_rng = random.Random(args.seed)
-    fixed_idx = fixed_rng.randrange(len(val_ds))
+    fixed_idx = fixed_rng.randrange(len(val_ds)) if len(val_ds) > 0 else None
 
     history = {"train_loss": [], "val_loss": [], "fvd": [], "fvd_epochs": []}
     best_val_loss = float("inf")
@@ -261,7 +261,7 @@ def train(args):
             
             logger.add_scalar("val/loss", val_loss_epoch, epoch + 1)
 
-            if (epoch + 1) % args.vis_every == 0:
+            if (epoch + 1) % args.vis_every == 0 and fixed_idx is not None:
                 preview_sample = val_ds[fixed_idx]
                 preview_cond = preview_sample["cond"].unsqueeze(0).to(device)
                 preview_video = sample_video(
