@@ -22,7 +22,7 @@ from utils.distributed import cleanup_distributed, init_distributed, is_main_pro
 from utils.ema import EMA
 from utils.io import save_mp4
 from utils.logger import TrainLogger
-
+from tqdm.auto import tqdm
 
 MODEL_TYPE = "video_unet3d_cond"
 PREDICTION_TARGET = "v"
@@ -239,8 +239,14 @@ def train(args):
             train_sampler.set_epoch(epoch)
         model.train()
         epoch_losses = []
+        pbar = tqdm(
+            train_loader,
+            disable=not is_main_process(),
+            desc=f"epoch {epoch+1}/{args.epochs}",
+            leave=False,
+        )
 
-        for batch in train_loader:
+        for batch in pbar:
             cond = batch["cond"].to(device, non_blocking=True)
             clip = batch["clip"].to(device, non_blocking=True)
 
@@ -272,9 +278,11 @@ def train(args):
             ema.update(unwrap_model(model))
             global_step += 1
             epoch_losses.append(loss.item())
-
+            pbar.set_postfix({
+                "loss": f"{loss.item():.4f}",
+            })
             if global_step % args.log_every == 0 and is_main_process():
-                print(f"epoch={epoch+1} step={global_step} loss={loss.item():.6f}")
+                #print(f"epoch={epoch+1} step={global_step} loss={loss.item():.6f}")
                 logger.add_scalar("train/loss", float(loss.item()), global_step)
                 logger.add_scalar("learning_rate", float(opt.param_groups[0]["lr"]), global_step)
 
