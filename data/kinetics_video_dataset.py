@@ -56,15 +56,20 @@ class KineticsVideoDataset(Dataset):
         self,
         files: List[str],
         num_frames: int = 16,
-        size: int = 128,
+        size: int = 96,
         max_seconds: int = 10,
         cache_videos: bool = False,
+        channels: int = 1,
     ):
         self.files = files
         self.num_frames = num_frames
         self.size = size
         self.max_seconds = max_seconds
         self.cache_videos = cache_videos
+        self.channels = channels
+        if self.channels not in (1, 3):
+            raise ValueError("channels must be 1 or 3")
+
         self._vr_cache: Dict[str, VideoReader] = {}
         self._meta_cache: Dict[str, Tuple[int, float]] = {}
 
@@ -90,13 +95,11 @@ class KineticsVideoDataset(Dataset):
     def _sample_indices(self, n: int, fps: float) -> np.ndarray:
         max_len = min(n, int(self.max_seconds * fps) if fps > 0 else n)
         max_len = max(max_len, self.num_frames)
+        window = min(self.num_frames, max_len)
 
-        stride = np.random.choice([1, 2, 3])
-        span = (self.num_frames - 1) * stride + 1
-        max_start = max(0, max_len - span)
+        max_start = max(0, max_len - window)
         start = np.random.randint(0, max_start + 1) if max_start > 0 else 0
-
-        idx = start + np.arange(self.num_frames) * stride
+        idx = start + np.arange(window)
         idx = np.clip(idx, 0, n - 1)
         return idx
 
@@ -130,16 +133,15 @@ class KineticsVideoDataset(Dataset):
                 processed = []
                 for f in frames:
                     f = self._resize_crop(f)
-                    gray = _to_gray(f)
-                    processed.append(gray)
+                    if self.channels == 1:
+                        f = _to_gray(f)[..., None]
+                    processed.append(f)
 
-                frames = np.stack(processed)  # [T,H,W]
+                frames = np.stack(processed)  # [T,H,W,C]
+                frames = torch.from_numpy(frames).permute(3, 0, 1, 2).float() / 127.5 - 1.0  # [C,T,H,W]
 
-                frames = torch.from_numpy(frames).unsqueeze(0).float() / 127.5 - 1
-                # [1,T,H,W]
-
-                cond = frames[:, 0]  # [1,H,W]
-                clip = frames        # [1,T,H,W]
+                cond = frames[:, 0]  # [C,H,W]
+                clip = frames        # [C,T,H,W]
 
                 return {
                     "cond": cond,
