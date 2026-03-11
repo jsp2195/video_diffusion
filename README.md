@@ -50,7 +50,7 @@ Grayscale remains available as an optional mode (`--color_mode gray`), but RGB i
 - `res_blocks=2`
 - `temporal_attn_levels=1 2`
 - `cfg_drop_prob=0.08`
-- `temporal_loss_weight=0.0` (disabled)
+- `temporal_loss_weight=0.05` (enabled)
 - `noise_offset=0.0` (disabled)
 - `dynamic_threshold=False` (disabled)
 - `color_mode=rgb` (default, recommended)
@@ -90,7 +90,7 @@ python train_video_ddpm.py \
   --channel_mults 1 2 4 \
   --temporal_attn_levels 1 2 \
   --cfg_drop_prob 0.08 \
-  --temporal_loss_weight 0.0 \
+  --temporal_loss_weight 0.05 \
   --vis_every 1 \
   --num_workers 2
 ```
@@ -114,7 +114,7 @@ python train_video_ddpm.py \
   --channel_mults 1 2 4 \
   --temporal_attn_levels 1 2 \
   --cfg_drop_prob 0.08 \
-  --temporal_loss_weight 0.0 \
+  --temporal_loss_weight 0.05 \
   --vis_every 1 \
   --amp
 ```

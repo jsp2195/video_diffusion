@@ -304,12 +304,14 @@ def train(args):
             amp_ctx = torch.cuda.amp.autocast(enabled=args.amp) if torch.cuda.is_available() else nullcontext()
             with amp_ctx:
                 pred_v = model(x_t, t, cond_start_ctx, cond_end_ctx)
-                loss = F.mse_loss(pred_v, v_target)
+                diffusion_loss = F.mse_loss(pred_v, v_target)
+                loss = diffusion_loss
                 if args.temporal_loss_weight > 0:
                     pred_x0 = diffusion.predict_x0_from_v(x_t, pred_v, t)
                     pred_dt = pred_x0[:, :, 1:] - pred_x0[:, :, :-1]
                     target_dt = middle[:, :, 1:] - middle[:, :, :-1]
-                    loss = loss + args.temporal_loss_weight * F.l1_loss(pred_dt, target_dt)
+                    temporal_loss = F.l1_loss(pred_dt, target_dt)
+                    loss = diffusion_loss + args.temporal_loss_weight * temporal_loss
 
             opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
@@ -343,12 +345,14 @@ def train(args):
                 x_t, noise = diffusion.forward_noise(middle, t, noise_offset=args.noise_offset)
                 v_target = diffusion.velocity_target(middle, noise, t)
                 pred_v = model(x_t, t, cond_start_ctx, cond_end_ctx)
-                val_loss = F.mse_loss(pred_v, v_target)
+                diffusion_loss = F.mse_loss(pred_v, v_target)
+                val_loss = diffusion_loss
                 if args.temporal_loss_weight > 0:
                     pred_x0 = diffusion.predict_x0_from_v(x_t, pred_v, t)
                     pred_dt = pred_x0[:, :, 1:] - pred_x0[:, :, :-1]
                     target_dt = middle[:, :, 1:] - middle[:, :, :-1]
-                    val_loss = val_loss + args.temporal_loss_weight * F.l1_loss(pred_dt, target_dt)
+                    temporal_loss = F.l1_loss(pred_dt, target_dt)
+                    val_loss = diffusion_loss + args.temporal_loss_weight * temporal_loss
                 val_losses.append(val_loss.item())
 
         val_loss_epoch = float(np.mean(val_losses)) if val_losses else 0.0
@@ -451,7 +455,7 @@ def build_parser():
     p.add_argument("--channel_mults", type=int, nargs="+", default=[1, 2, 4])
     p.add_argument("--res_blocks", type=int, default=2)
     p.add_argument("--temporal_attn_levels", type=int, nargs="+", default=[1, 2])
-    p.add_argument("--temporal_loss_weight", type=float, default=0.0)
+    p.add_argument("--temporal_loss_weight", type=float, default=0.05)
     p.add_argument("--log_every", type=int, default=20)
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--seed", type=int, default=42)
