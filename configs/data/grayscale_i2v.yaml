@@ -1,0 +1,6 @@
+root: /path/to/data_root
+val_ratio: 0.01
+num_frames: 12
+size: 96
+max_videos: null
+cache_videos: false
