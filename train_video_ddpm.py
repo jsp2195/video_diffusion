@@ -26,6 +26,7 @@ from tqdm.auto import tqdm
 
 MODEL_TYPE = "video_unet3d_cond"
 PREDICTION_TARGET = "v"
+TASK_MODE = "future_only_from_first_frame"
 
 
 def set_seed(seed: int, rank: int = 0):
@@ -54,7 +55,13 @@ def build_model_config(args: argparse.Namespace) -> Dict:
         "base_channels": args.base_channels,
         "channel_mult": list(args.channel_mults),
         "num_res_blocks": args.res_blocks,
+        "temporal_attn_levels": list(args.temporal_attn_levels),
+        "cond_encoder_type": "multiscale_pyramid",
+        "cond_injection_mode": "add",
         "prediction_target": PREDICTION_TARGET,
+        "task_mode": TASK_MODE,
+        "T": args.T,
+        "frame_stride": args.frame_stride,
     }
 
 
@@ -63,6 +70,12 @@ def make_model_from_config(model_cfg: Dict) -> VideoUNet3DConditional:
         raise ValueError(f"Unsupported model_type={model_cfg.get('model_type')}")
     if model_cfg.get("prediction_target", PREDICTION_TARGET) != PREDICTION_TARGET:
         raise ValueError("Only v-prediction checkpoints are supported in this baseline.")
+    if model_cfg.get("task_mode", TASK_MODE) != TASK_MODE:
+        raise ValueError(f"Unsupported task_mode={model_cfg.get('task_mode')}. Expected {TASK_MODE}.")
+    if model_cfg.get("cond_encoder_type", "multiscale_pyramid") != "multiscale_pyramid":
+        raise ValueError("Unsupported cond_encoder_type. Expected multiscale_pyramid.")
+    if model_cfg.get("cond_injection_mode", "add") != "add":
+        raise ValueError("Unsupported cond_injection_mode. Expected add.")
 
     return VideoUNet3DConditional(
         in_channels=model_cfg.get("in_channels", 1),
@@ -70,13 +83,15 @@ def make_model_from_config(model_cfg: Dict) -> VideoUNet3DConditional:
         base_channels=model_cfg["base_channels"],
         channel_mult=tuple(model_cfg["channel_mult"]),
         num_res_blocks=model_cfg["num_res_blocks"],
+        temporal_attn_levels=tuple(model_cfg.get("temporal_attn_levels", [1, 2])),
+        cond_injection_mode=model_cfg.get("cond_injection_mode", "add"),
     )
 
 
 @torch.no_grad()
-def sample_video(model, diffusion, cond, t_len: int, size: int, steps: int, guidance_scale: float, eta: float = 0.0):
+def sample_video(model, diffusion, cond, future_len: int, size: int, steps: int, guidance_scale: float, eta: float = 0.0, dynamic_threshold: bool = False):
     device = cond.device
-    x = torch.randn(1, 1, t_len, size, size, device=device)
+    x = torch.randn(1, 1, future_len, size, size, device=device)
     ddim_times = torch.linspace(diffusion.timesteps - 1, 0, steps, device=device).long()
     for i in range(len(ddim_times)):
         t = ddim_times[i].view(1)
@@ -85,7 +100,7 @@ def sample_video(model, diffusion, cond, t_len: int, size: int, steps: int, guid
         v_u = model(x, t, zeros_cond)
         v_c = model(x, t, cond)
         v = v_u + guidance_scale * (v_c - v_u)
-        x = diffusion.ddim_step_from_v(x, v, t, t_prev, eta=eta)
+        x = diffusion.ddim_step_from_v(x, v, t, t_prev, eta=eta, dynamic_threshold=dynamic_threshold)
     return x
 
 
@@ -101,16 +116,18 @@ def evaluate_fvd_proxy(ema_model, diffusion, val_ds, args, device):
         sample = val_ds[idx]
         cond = sample["cond"].unsqueeze(0).to(device)
         real = sample["clip"].unsqueeze(0).to(device)
-        gen = sample_video(
+        gen_future = sample_video(
             ema_model,
             diffusion,
             cond,
-            t_len=args.T,
+            future_len=args.T - 1,
             size=args.size,
             steps=args.vis_steps,
             guidance_scale=args.vis_guidance_scale,
             eta=0.0,
+            dynamic_threshold=args.dynamic_threshold,
         )
+        gen = torch.cat([cond.unsqueeze(2), gen_future], dim=2)
         real_videos.append(real)
         gen_videos.append(gen)
 
@@ -120,6 +137,9 @@ def evaluate_fvd_proxy(ema_model, diffusion, val_ds, args, device):
 
 
 def train(args):
+    if args.T < 2:
+        raise ValueError("--T must be >= 2 for future-only prediction.")
+
     distributed, rank, local_rank, world_size = init_distributed()
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
     set_seed(args.seed, rank)
@@ -133,8 +153,8 @@ def train(args):
     if args.overfit_16:
         train_files = train_files[:16]
 
-    train_ds = KineticsVideoDataset(train_files, num_frames=args.T, size=args.size, cache_videos=args.cache_videos)
-    val_ds = KineticsVideoDataset(val_files, num_frames=args.T, size=args.size, cache_videos=args.cache_videos)
+    train_ds = KineticsVideoDataset(train_files, num_frames=args.T, frame_stride=args.frame_stride, size=args.size, cache_videos=args.cache_videos)
+    val_ds = KineticsVideoDataset(val_files, num_frames=args.T, frame_stride=args.frame_stride, size=args.size, cache_videos=args.cache_videos)
 
     g = torch.Generator()
     g.manual_seed(args.seed + rank)
@@ -249,14 +269,15 @@ def train(args):
         for batch in pbar:
             cond = batch["cond"].to(device, non_blocking=True)
             clip = batch["clip"].to(device, non_blocking=True)
+            future = clip[:, :, 1:]
 
             if args.cfg_drop_prob > 0:
                 mask = (torch.rand(cond.shape[0], device=device) < args.cfg_drop_prob).float().view(-1, 1, 1, 1)
                 cond = cond * (1.0 - mask)
 
             t = diffusion.sample_timesteps(cond.shape[0], device)
-            x_t, noise = diffusion.forward_noise(clip, t)
-            v_target = diffusion.velocity_target(clip, noise, t)
+            x_t, noise = diffusion.forward_noise(future, t, noise_offset=args.noise_offset)
+            v_target = diffusion.velocity_target(future, noise, t)
 
             amp_ctx = torch.cuda.amp.autocast(enabled=args.amp) if torch.cuda.is_available() else nullcontext()
             with amp_ctx:
@@ -265,7 +286,7 @@ def train(args):
                 if args.temporal_loss_weight > 0:
                     pred_x0 = diffusion.predict_x0_from_v(x_t, pred_v, t)
                     pred_dt = pred_x0[:, :, 1:] - pred_x0[:, :, :-1]
-                    target_dt = clip[:, :, 1:] - clip[:, :, :-1]
+                    target_dt = future[:, :, 1:] - future[:, :, :-1]
                     loss = loss + args.temporal_loss_weight * F.l1_loss(pred_dt, target_dt)
 
             opt.zero_grad(set_to_none=True)
@@ -296,15 +317,16 @@ def train(args):
             for batch in val_loader:
                 cond = batch["cond"].to(device, non_blocking=True)
                 clip = batch["clip"].to(device, non_blocking=True)
+                future = clip[:, :, 1:]
                 t = diffusion.sample_timesteps(cond.shape[0], device)
-                x_t, noise = diffusion.forward_noise(clip, t)
-                v_target = diffusion.velocity_target(clip, noise, t)
+                x_t, noise = diffusion.forward_noise(future, t, noise_offset=args.noise_offset)
+                v_target = diffusion.velocity_target(future, noise, t)
                 pred_v = model(x_t, t, cond)
                 val_loss = F.mse_loss(pred_v, v_target)
                 if args.temporal_loss_weight > 0:
                     pred_x0 = diffusion.predict_x0_from_v(x_t, pred_v, t)
                     pred_dt = pred_x0[:, :, 1:] - pred_x0[:, :, :-1]
-                    target_dt = clip[:, :, 1:] - clip[:, :, :-1]
+                    target_dt = future[:, :, 1:] - future[:, :, :-1]
                     val_loss = val_loss + args.temporal_loss_weight * F.l1_loss(pred_dt, target_dt)
                 val_losses.append(val_loss.item())
 
@@ -347,16 +369,18 @@ def train(args):
             if (epoch + 1) % args.vis_every == 0 and fixed_idx is not None:
                 preview_sample = val_ds[fixed_idx]
                 preview_cond = preview_sample["cond"].unsqueeze(0).to(device)
-                preview_video = sample_video(
+                preview_future = sample_video(
                     ema_model,
                     diffusion,
                     preview_cond,
-                    t_len=args.T,
+                    future_len=args.T - 1,
                     size=args.size,
                     steps=args.vis_steps,
                     guidance_scale=args.vis_guidance_scale,
                     eta=0.0,
+                    dynamic_threshold=args.dynamic_threshold,
                 )
+                preview_video = torch.cat([preview_cond.unsqueeze(2), preview_future], dim=2)
                 preview_path = os.path.join(args.out_dir, f"epoch_{epoch+1:04d}_sample.mp4")
                 save_mp4(preview_video[0], preview_path, fps=8)
                 logger.add_video("preview/video", ((preview_video.clamp(-1, 1) + 1.0) / 2.0).permute(0, 2, 1, 3, 4), epoch + 1, fps=8)
@@ -387,18 +411,20 @@ def build_parser():
     p.add_argument("--out_dir", type=str, default="outputs/train")
     p.add_argument("--T", type=int, default=8)
     p.add_argument("--size", type=int, default=64)
+    p.add_argument("--frame_stride", type=int, default=1)
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--epochs", type=int, default=30)
     p.add_argument("--timesteps", type=int, default=1000)
     p.add_argument("--beta_schedule", type=str, default="cosine", choices=["cosine", "linear"])
-    p.add_argument("--cfg_drop_prob", type=float, default=0.15)
+    p.add_argument("--cfg_drop_prob", type=float, default=0.08)
     p.add_argument("--ema_decay", type=float, default=0.999)
     p.add_argument("--ema_update_after_step", type=int, default=100)
-    p.add_argument("--base_channels", type=int, default=64)
+    p.add_argument("--base_channels", type=int, default=96)
     p.add_argument("--channel_mults", type=int, nargs="+", default=[1, 2, 4])
     p.add_argument("--res_blocks", type=int, default=2)
-    p.add_argument("--temporal_loss_weight", type=float, default=0.02)
+    p.add_argument("--temporal_attn_levels", type=int, nargs="+", default=[1, 2])
+    p.add_argument("--temporal_loss_weight", type=float, default=0.0)
     p.add_argument("--log_every", type=int, default=20)
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--seed", type=int, default=42)
@@ -410,6 +436,8 @@ def build_parser():
     p.add_argument("--vis_every", type=int, default=1)
     p.add_argument("--vis_guidance_scale", type=float, default=1.5)
     p.add_argument("--vis_steps", type=int, default=40)
+    p.add_argument("--noise_offset", type=float, default=0.0)
+    p.add_argument("--dynamic_threshold", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--tensorboard", action="store_true")
     p.add_argument("--log_dir", type=str, default="runs")
     p.add_argument("--eval_fvd_every", type=int, default=0)

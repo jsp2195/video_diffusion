@@ -1,141 +1,134 @@
-# Lightweight First-Frame Conditioned Grayscale Video Diffusion (PyTorch)
+# Lightweight First-Frame-to-Future Grayscale Video Diffusion (PyTorch)
 
-A practical baseline for generating short grayscale videos conditioned on a single first frame:
+This repository is an MVP baseline for **future video continuation from a known first frame**:
 
 \[
-  p(\text{video} \mid \text{first frame})
+  p(\text{frames}_{1..T-1} \mid \text{frame}_0)
 \]
 
-This repo intentionally prioritizes **first success, speed, and debuggability** over SOTA quality.
+## Active task (default everywhere)
 
-## Active default pipeline
+- `frame_0` is conditioning-only input (`cond`, shape `[1,H,W]`)
+- diffusion target is only future frames (`future`, shape `[1,T-1,H,W]`)
+- the model does **not** denoise/regenerate frame 0
+- sampling generates future frames only, then prepends the real condition frame
 
-- Pixel-space grayscale diffusion (not latent diffusion)
-- Compact conditional 3D U-Net (`models/video_unet3d.py`)
-- First-frame conditioning by repeat + concat (`[B,2,T,H,W]` model input)
-- DDPM training with **v-prediction**
-- DDIM sampling
-- EMA weights used for previews and inference by default
-- AMP enabled by default (`--amp`, disable with `--no-amp`)
-- Gradient clipping + classifier-free condition dropout
-- Optional tiny temporal smoothness auxiliary loss
+Final sampled clips are always:
 
-## Lightweight defaults
+`[frame_0, generated_frame_1, ..., generated_frame_{T-1}]`
+
+## Baseline architecture (upgraded conditioning)
+
+- Pixel-space grayscale diffusion (no latent stage)
+- Lightweight 3D U-Net denoiser (`models/video_unet3d.py`)
+- **Multiscale conditioning encoder** for frame 0 (`models/conditioning_encoder.py`)
+- Condition features are injected at:
+  - input stem
+  - each down block
+  - bottleneck
+  - each up block
+- Input concat is retained as a small auxiliary path, but conditioning is no longer input-only
+- DDPM training with v-prediction + DDIM sampling
+- EMA for preview/inference
+- AMP + grad clipping
+
+## MVP defaults (single-GPU practical)
 
 - `size=64`
 - `T=8`
-- `base_channels=64`
+- `frame_stride=1`
+- `base_channels=96`
 - `channel_mults=1 2 4`
 - `res_blocks=2`
-
-## Install
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install --upgrade pip
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
-pip install decord imageio[ffmpeg] numpy pillow pyyaml matplotlib
-```
+- `temporal_attn_levels=1 2`
+- `cfg_drop_prob=0.08`
+- `temporal_loss_weight=0.0`
+- `noise_offset=0.0` (disabled)
+- `dynamic_threshold=False` (disabled)
 
 ## Dataset expectations
 
 The loader recursively discovers MP4s under `data_root`.
 
-Examples of valid layouts:
-
-```text
-/path/to/data_root/**/*.mp4
-/path/to/data_root/videos_val/**/*.mp4
-```
-
-Returned dataset contract:
+Returned sample contract:
 
 - `cond`: `[1,H,W]` first frame
-- `clip`: `[1,T,H,W]` grayscale clip in `[-1,1]`
+- `clip`: `[1,T,H,W]` full real clip (used to derive future target)
 
-## First overfit run (recommended)
+During training/validation, active target is always `clip[:, :, 1:]`.
+
+## Commands
+
+### 1) First overfit run
 
 ```bash
 python train_video_ddpm.py \
   --data_root /path/to/data_root \
-  --out_dir ./outputs/overfit_test \
+  --out_dir ./outputs/overfit_bair_mvp \
   --max_videos 64 \
+  --size 64 \
+  --T 8 \
+  --frame_stride 1 \
   --batch_size 2 \
   --epochs 20 \
   --max_steps 500 \
+  --base_channels 96 \
+  --channel_mults 1 2 4 \
+  --temporal_attn_levels 1 2 \
+  --cfg_drop_prob 0.08 \
+  --temporal_loss_weight 0.0 \
   --vis_every 1 \
   --num_workers 2
 ```
 
-## Normal lightweight run
+### 2) Normal training run
 
 ```bash
 python train_video_ddpm.py \
   --data_root /path/to/data_root \
-  --out_dir ./outputs/train_light \
+  --out_dir ./outputs/train_bair_mvp \
   --size 64 \
   --T 8 \
+  --frame_stride 1 \
   --batch_size 8 \
   --epochs 30 \
   --num_workers 4 \
   --lr 1e-4 \
+  --base_channels 96 \
+  --channel_mults 1 2 4 \
+  --temporal_attn_levels 1 2 \
+  --cfg_drop_prob 0.08 \
+  --temporal_loss_weight 0.0 \
   --vis_every 1 \
-  --cfg_drop_prob 0.15 \
   --amp
 ```
 
-## Resume training
+### 3) Resume run
 
 ```bash
 python train_video_ddpm.py \
   --data_root /path/to/data_root \
-  --out_dir ./outputs/train_light \
+  --out_dir ./outputs/train_bair_mvp \
   --resume
 ```
 
-`--resume` loads `out_dir/last.pt` (model, EMA, optimizer, scheduler, scaler, step/epoch, and model config).
-
-## Sampling from checkpoint (EMA default)
-
-Using condition image:
+### 4) Sampling run (EMA default)
 
 ```bash
 python sample_video_ddpm.py \
-  --ckpt ./outputs/train_light/last.pt \
+  --ckpt ./outputs/train_bair_mvp/last.pt \
   --input_image ./cond.png \
-  --out_dir ./outputs/sample \
+  --out_dir ./outputs/sample_bair_mvp \
   --steps 40 \
   --eta 0.0 \
   --guidance_scale 1.8 \
   --device cuda
 ```
 
-Using random dataset condition frame:
-
-```bash
-python sample_video_ddpm.py \
-  --ckpt ./outputs/train_light/last.pt \
-  --data_root /path/to/data_root \
-  --out_dir ./outputs/sample \
-  --steps 40 \
-  --guidance_scale 1.8
-```
-
-Sampling **automatically reconstructs the trained architecture from checkpoint metadata** (`model_config`), so users do not need to re-enter architecture args.
-
-Outputs:
-
-- `cond.png`
-- `sample.mp4`
-
-## Metrics note (honesty)
-
-`metrics/fvd.py` provides a lightweight **proxy** metric (`fvd_proxy`) using a small internal encoder.
-It is useful for relative debugging trends only and is **not** canonical I3D-based FVD.
+Sampling reconstructs architecture and task metadata from checkpoint config, then generates future-only frames before prepending `frame_0`.
 
 ## Limitations
 
-- Not SOTA quality; this is a compact baseline.
-- Motion quality depends heavily on data diversity and clip count.
-- Best workflow: overfit small subset first, then scale data and training length.
+- Compact baseline optimized for first success on simple structured motion.
+- Long-horizon or highly stochastic scenes can still drift.
+- Grayscale MVP prioritizes stability/iteration speed over visual richness.
