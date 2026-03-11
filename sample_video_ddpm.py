@@ -39,7 +39,9 @@ def sample(args):
     ).to(device)
 
     if not args.use_raw_model:
-        if "ema_state_dict" in ckpt:
+        if "ema_model" in ckpt:
+            model.load_state_dict(ckpt["ema_model"])
+        elif "ema_state_dict" in ckpt:
             model.load_state_dict(ckpt["ema_state_dict"]["model"])
         elif "ema" in ckpt and isinstance(ckpt["ema"], dict) and "model" in ckpt["ema"]:
             model.load_state_dict(ckpt["ema"]["model"])
@@ -69,7 +71,7 @@ def sample(args):
         zeros_cond = torch.zeros_like(cond)
         v_uncond = model(x, t, zeros_cond)
         v_cond = model(x, t, cond)
-        v = v_uncond + args.cfg_scale * (v_cond - v_uncond)
+        v = v_uncond + args.guidance_scale * (v_cond - v_uncond)
 
         x = diffusion.ddim_step_from_v(x, v, t, t_prev, eta=args.ddim_eta)
         x[:, :, 0] = cond
@@ -97,11 +99,14 @@ def parse_args():
     p.add_argument("--beta_schedule", type=str, default="cosine", choices=["cosine", "linear"])
     p.add_argument("--ddim_steps", type=int, default=50)
     p.add_argument("--ddim_eta", type=float, default=0.0)
-    p.add_argument("--cfg_scale", type=float, default=2.0)
+    p.add_argument("--guidance_scale", type=float, default=3.0)
+    p.add_argument("--cfg_scale", type=float, default=None)
     p.add_argument("--fps", type=int, default=8)
     p.add_argument("--use_raw_model", action="store_true")
     args = p.parse_args()
 
+    if args.cfg_scale is not None:
+        args.guidance_scale = args.cfg_scale
     if args.cond_image is None and args.data_root is None:
         raise ValueError("Provide --cond_image or --data_root")
     return args

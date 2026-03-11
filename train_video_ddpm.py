@@ -2,6 +2,7 @@ import argparse
 import os
 import random
 from contextlib import nullcontext
+from copy import deepcopy
 
 import numpy as np
 import torch
@@ -18,7 +19,6 @@ from models.video_unet3d import VideoUNet3DConditional
 from utils.config import parse_with_config
 from utils.diagnostics import save_training_curves
 from utils.distributed import cleanup_distributed, get_world_size, init_distributed, is_main_process
-from utils.ema import EMA
 from utils.io import save_mp4
 from utils.logger import TrainLogger
 
@@ -167,10 +167,13 @@ def train(args):
         attention_heads=8,
         max_temporal_length=max(32, args.T),
     ).to(device)
+    ema_model = deepcopy(model)
+    ema_model.eval()
+    ema_decay = 0.9999
+
     if distributed:
         model = DDP(model, device_ids=[local_rank] if torch.cuda.is_available() else None, output_device=local_rank if torch.cuda.is_available() else None, find_unused_parameters=False)
 
-    ema = EMA(unwrap_model(model), decay=args.ema_decay, update_after_step=1000)
     diffusion = DiffusionSchedule(args.timesteps, schedule=args.beta_schedule).to(device)
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
@@ -186,9 +189,13 @@ def train(args):
     resume_ckpt = os.path.join(args.out_dir, "last.pt")
     if args.resume and os.path.exists(resume_ckpt):
         ckpt = torch.load(resume_ckpt, map_location=device)
-        unwrap_model(model).load_state_dict(ckpt["model_state_dict"])
-        ema.load_state_dict(ckpt["ema_state_dict"])
-        opt.load_state_dict(ckpt["optimizer_state_dict"])
+        model_state = ckpt.get("model_state_dict", ckpt.get("model"))
+        unwrap_model(model).load_state_dict(model_state)
+        if "ema_model" in ckpt:
+            ema_model.load_state_dict(ckpt["ema_model"])
+        elif "ema_state_dict" in ckpt and "model" in ckpt["ema_state_dict"]:
+            ema_model.load_state_dict(ckpt["ema_state_dict"]["model"])
+        opt.load_state_dict(ckpt.get("optimizer_state_dict", ckpt.get("optimizer")))
         sched.load_state_dict(ckpt["scheduler_state_dict"])
         scaler.load_state_dict(ckpt["scaler_state_dict"])
         global_step = ckpt["step"]
@@ -209,9 +216,8 @@ def train(args):
             cond = batch["cond"].to(device, non_blocking=True)
             clip = batch["clip"].to(device, non_blocking=True)
 
-            if args.cfg_drop_prob > 0:
-                mask = (torch.rand(cond.shape[0], device=device) < args.cfg_drop_prob).float().view(-1, 1, 1, 1)
-                cond = cond * (1.0 - mask)
+            if args.cfg_drop_prob > 0 and torch.rand(1, device=device).item() < args.cfg_drop_prob:
+                cond = torch.zeros_like(cond)
 
             t = diffusion.sample_timesteps(cond.shape[0], device)
             x_t, noise = diffusion.forward_noise(clip, t)
@@ -220,7 +226,12 @@ def train(args):
             amp_ctx = torch.cuda.amp.autocast(enabled=args.amp) if torch.cuda.is_available() else nullcontext()
             with amp_ctx:
                 pred_v = model(x_t, t, cond)
-                diffusion_loss = F.mse_loss(pred_v, v_target)
+                mse = F.mse_loss(pred_v, v_target, reduction="none")
+                alpha_t = diffusion.alpha_bar[t].view(-1, 1, 1, 1, 1)
+                snr = alpha_t / (1.0 - alpha_t)
+                gamma = 5.0
+                weight = torch.minimum(snr, torch.full_like(snr, gamma)) / snr
+                diffusion_loss = (weight * mse).mean()
                 pred_x0 = diffusion.predict_x0_from_v(x_t, pred_v, t)
                 temp_loss = temporal_smoothness_loss(pred_x0)
                 loss = diffusion_loss + args.lambda_temporal * temp_loss
@@ -232,7 +243,9 @@ def train(args):
             scaler.update()
             opt.zero_grad(set_to_none=True)
             sched.step()
-            ema.update(unwrap_model(model))
+            with torch.no_grad():
+                for p_ema, p in zip(ema_model.parameters(), unwrap_model(model).parameters()):
+                    p_ema.data.mul_(ema_decay).add_(p.data, alpha=1 - ema_decay)
             global_step += 1
             epoch_losses.append(loss.item())
 
@@ -255,7 +268,12 @@ def train(args):
                 x_t, noise = diffusion.forward_noise(clip, t)
                 v_target = diffusion.velocity_target(clip, noise, t)
                 pred_v = model(x_t, t, cond)
-                diffusion_loss = F.mse_loss(pred_v, v_target)
+                mse = F.mse_loss(pred_v, v_target, reduction="none")
+                alpha_t = diffusion.alpha_bar[t].view(-1, 1, 1, 1, 1)
+                snr = alpha_t / (1.0 - alpha_t)
+                gamma = 5.0
+                weight = torch.minimum(snr, torch.full_like(snr, gamma)) / snr
+                diffusion_loss = (weight * mse).mean()
                 pred_x0 = diffusion.predict_x0_from_v(x_t, pred_v, t)
                 temp_loss = temporal_smoothness_loss(pred_x0)
                 val_losses.append((diffusion_loss + args.lambda_temporal * temp_loss).item())
@@ -277,8 +295,10 @@ def train(args):
             model_unwrapped = unwrap_model(model)
             ckpt = {
                 "model_state_dict": model_unwrapped.state_dict(),
-                "ema_state_dict": ema.state_dict(),
+                "model": model_unwrapped.state_dict(),
+                "ema_model": ema_model.state_dict(),
                 "optimizer_state_dict": opt.state_dict(),
+                "optimizer": opt.state_dict(),
                 "scheduler_state_dict": sched.state_dict(),
                 "scaler_state_dict": scaler.state_dict(),
                 "step": global_step,
@@ -294,7 +314,6 @@ def train(args):
             if (epoch + 1) % args.vis_every == 0 and fixed_idx is not None:
                 preview_sample = val_ds[fixed_idx]
                 preview_cond = preview_sample["cond"].unsqueeze(0).to(device)
-                ema_model = ema.ema_model if hasattr(ema, "ema_model") else ema
                 preview_video = sample_video(
                     ema_model,
                     diffusion,
@@ -311,7 +330,6 @@ def train(args):
                 logger.add_video("preview/video", ((preview_video.clamp(-1, 1) + 1.0) / 2.0).permute(0, 2, 1, 3, 4), epoch + 1, fps=8)
 
             if args.eval_fvd_every > 0 and (epoch + 1) % args.eval_fvd_every == 0:
-                ema_model = ema.ema_model if hasattr(ema, "ema_model") else ema
                 fvd_score = evaluate_fvd(ema_model, diffusion, val_ds, args, device)
                 history["fvd"].append(fvd_score)
                 history["fvd_epochs"].append(epoch + 1)
