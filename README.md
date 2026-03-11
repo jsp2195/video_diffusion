@@ -1,147 +1,143 @@
-# Grayscale Conditional Video DDPM (PyTorch MVP)
+# Lightweight First-Frame Conditioned Grayscale Video Diffusion (PyTorch)
 
-This repo refactors the single-image conditional DDPM baseline into a **first-frame conditioned grayscale video DDPM**.
+This repository now defaults to a **compact pixel-space 3D U-Net DDPM baseline** for:
 
-## Core tensor contract
+- `p(video | first_frame)`
+- grayscale MP4s
+- fast, stable iteration on limited hardware
 
-- `cond_first_frame`: `[B,1,H,W]`
-- `clip`: `[B,1,T,H,W]`
-- `pred_noise = model(noisy_clip, t, cond_first_frame)`
-- `noisy_clip`: `[B,1,T,H,W]`
-- `t`: `[B]` (`int64`)
-- `pred_noise`: `[B,1,T,H,W]`
+## Default model path (active)
 
-The training objective is unchanged: epsilon-prediction MSE (`MSE(pred_noise, noise)`).
+- Compact 3D U-Net denoiser (`models/video_unet3d.py`)
+- Input noisy clip shape: `[B,1,T,H,W]`
+- Input condition frame shape: `[B,1,H,W]`
+- Conditioning method: repeat condition over time and concatenate (`[B,2,T,H,W]`)
+- v-prediction objective
+- DDPM training + DDIM sampling
+- EMA for previews/sampling
+- AMP enabled by default (`--amp`, disable with `--no-amp`)
+- Gradient clipping
+- Classifier-free condition dropout
+- Optional tiny temporal smoothness loss (`--temporal_loss_weight`, default `0.02`)
 
-## Install dependencies
+### Compact defaults
+
+- `size=64`
+- `T=8`
+- `base_channels=64`
+- `channel_mults=1 2 4`
+- `res_blocks=2`
+
+## What changed from heavier paths
+
+- The default workflow no longer uses transformer-style denoisers.
+- The default workflow is no longer configured around heavy high-resolution / long-clip settings.
+- The active train and sample scripts instantiate the compact 3D U-Net by default.
+
+Legacy modules may still exist in the repo for reference, but they are not wired as the primary path.
+
+## Install
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
-pip install decord imageio[ffmpeg] numpy pillow
+pip install decord imageio[ffmpeg] numpy pillow pyyaml
 ```
 
-## Dataset setup (optional downloader integration)
+## Dataset layout
 
-If mp4 files already exist under `data_root/videos_val/**/*.mp4`, you can skip downloader setup entirely.
-
-### 1) Unzip downloader package
-
-```bash
-bash scripts/setup_kinetics_downloader.sh /mnt/data/kinetics-dataset-main.zip vendor/kinetics_downloader
-```
-
-### 2) Run downloader scripts (if needed)
-
-After unzip, inspect available scripts:
-
-```bash
-find vendor/kinetics_downloader -maxdepth 3 -type f \( -name '*.sh' -o -name 'k400_*' \)
-```
-
-Typical usage (depends on downloaded package contents):
-
-```bash
-bash vendor/kinetics_downloader/kinetics-dataset-main/download.sh
-bash vendor/kinetics_downloader/kinetics-dataset-main/extract.sh
-```
-
-Expected layout used by this training code:
+Expected structure:
 
 ```text
-data_root/
+<data_root>/
   videos_val/
     .../*.mp4
 ```
 
-The loader discovers videos using recursive glob on `data_root/videos_val/**/*.mp4`.
+Loader contract:
 
-## Smoke test
+- `cond`: `[1,H,W]` (first frame)
+- `clip`: `[1,T,H,W]` (grayscale clip in `[-1,1]`)
 
-```bash
-bash scripts/smoke_subset.sh /path/to/data_root ./outputs/smoke
-```
-
-Equivalent direct command:
+## First overfit test (recommended first run)
 
 ```bash
 python train_video_ddpm.py \
   --data_root /path/to/data_root \
-  --val_ratio 0.01 \
-  --max_videos 200 \
-  --max_steps 30 \
-  --shape_check
-```
-
-## Train
-
-```bash
-python train_video_ddpm.py \
-  --data_root /path/to/data_root \
-  --out_dir ./outputs/train \
-  --val_ratio 0.01 \
-  --T 16 \
-  --size 128 \
+  --out_dir ./outputs/overfit_test \
+  --max_videos 64 \
   --batch_size 2 \
-  --lr 1e-4 \
   --epochs 20 \
-  --timesteps 1000 \
-  --cfg_drop_prob 0.1 \
-  --ema_decay 0.999 \
-  --save_every 500 \
+  --max_steps 500 \
+  --vis_every 1 \
+  --num_workers 2
+```
+
+## Normal lightweight training run
+
+```bash
+python train_video_ddpm.py \
+  --data_root /path/to/data_root \
+  --out_dir ./outputs/train_light \
+  --size 64 \
+  --T 8 \
+  --batch_size 8 \
+  --epochs 30 \
   --num_workers 4 \
-  --seed 42 \
+  --lr 1e-4 \
+  --vis_every 1 \
+  --cfg_drop_prob 0.15 \
   --amp
 ```
 
-Startup prints:
-- total discovered mp4 count
-- train/val split sizes
-- first 3 file paths
-
-Split rules:
-- deterministic shuffle using `--seed`
-- `--max_videos N`: applied **after shuffle**, taking first `N`
-- split then uses `--val_ratio`
-
-## Overfit sanity mode
-
-```bash
-python train_video_ddpm.py \
-  --data_root /path/to/data_root \
-  --overfit_16 \
-  --max_steps 200 \
-  --batch_size 1
-```
-
-## Sample (DDIM + CFG)
-
-Using dataset-derived condition frame:
+## Sampling (EMA + DDIM)
 
 ```bash
 python sample_video_ddpm.py \
-  --ckpt ./outputs/train/last.pt \
+  --ckpt ./outputs/train_light/last.pt \
   --data_root /path/to/data_root \
   --out_dir ./outputs/sample \
-  --T 16 \
-  --size 128 \
-  --ddim_steps 50 \
-  --ddim_eta 0 \
-  --cfg_scale 2.0
+  --size 64 \
+  --T 8 \
+  --ddim_steps 40 \
+  --cfg_scale 1.8
 ```
 
-Using custom condition image:
+or with a custom condition image:
 
 ```bash
 python sample_video_ddpm.py \
-  --ckpt ./outputs/train/last.pt \
-  --cond_image ./my_cond.png \
+  --ckpt ./outputs/train_light/last.pt \
+  --cond_image ./cond.png \
   --out_dir ./outputs/sample_custom \
-  --T 16 --size 128 --ddim_steps 50
+  --size 64 \
+  --T 8
 ```
 
 Outputs:
-- `cond.png`: first-frame condition
-- `sample.mp4`: generated grayscale clip
+
+- `cond.png`
+- `sample.mp4`
+
+## Key CLI options
+
+`train_video_ddpm.py`:
+- `--data_root`
+- `--out_dir`
+- `--size`
+- `--T`
+- `--batch_size`
+- `--epochs`
+- `--num_workers`
+- `--lr`
+- `--amp/--no-amp`
+- `--vis_every`
+- `--cfg_drop_prob`
+
+## Current limitations
+
+- This is a lightweight baseline for quick success, not SOTA quality.
+- Motion quality depends strongly on dataset diversity and clip count.
+- For best stability, first overfit a tiny subset, then scale data.

@@ -28,7 +28,13 @@ def sample(args):
     random.seed(args.seed)
 
     ckpt = torch.load(args.ckpt, map_location=device)
-    model = VideoUNetConditional(in_channels=1, base_channels=32).to(device)
+    model = VideoUNetConditional(
+        in_channels=1,
+        cond_channels=1,
+        base_channels=args.base_channels,
+        channel_mult=tuple(args.channel_mults),
+        num_res_blocks=args.res_blocks,
+    ).to(device)
 
     if not args.use_raw_model:
         if "ema_state_dict" in ckpt:
@@ -81,14 +87,17 @@ def parse_args():
     p.add_argument("--max_videos", type=int, default=None)
     p.add_argument("--cond_image", type=str, default=None)
     p.add_argument("--out_dir", type=str, default="outputs/sample")
-    p.add_argument("--T", type=int, default=16)
-    p.add_argument("--size", type=int, default=128)
+    p.add_argument("--T", type=int, default=8)
+    p.add_argument("--size", type=int, default=64)
     p.add_argument("--timesteps", type=int, default=1000)
     p.add_argument("--beta_schedule", type=str, default="cosine", choices=["cosine", "linear"])
-    p.add_argument("--ddim_steps", type=int, default=50)
+    p.add_argument("--ddim_steps", type=int, default=40)
     p.add_argument("--ddim_eta", type=float, default=0.0)
-    p.add_argument("--cfg_scale", type=float, default=2.0)
+    p.add_argument("--cfg_scale", type=float, default=1.8)
     p.add_argument("--fps", type=int, default=8)
+    p.add_argument("--base_channels", type=int, default=64)
+    p.add_argument("--channel_mults", type=int, nargs="+", default=[1, 2, 4])
+    p.add_argument("--res_blocks", type=int, default=2)
     p.add_argument("--use_raw_model", action="store_true")
     args = p.parse_args()
 

@@ -151,11 +151,17 @@ def train(args):
     if len(val_loader) == 0:
         raise RuntimeError("Validation loader is empty.")
 
-    model = VideoUNetConditional(in_channels=1, base_channels=32).to(device)
+    model = VideoUNetConditional(
+        in_channels=1,
+        cond_channels=1,
+        base_channels=args.base_channels,
+        channel_mult=tuple(args.channel_mults),
+        num_res_blocks=args.res_blocks,
+    ).to(device)
     if distributed:
         model = DDP(model, device_ids=[local_rank] if torch.cuda.is_available() else None, output_device=local_rank if torch.cuda.is_available() else None, find_unused_parameters=False)
 
-    ema = EMA(unwrap_model(model), decay=args.ema_decay, update_after_step=1000)
+    ema = EMA(unwrap_model(model), decay=args.ema_decay, update_after_step=args.ema_update_after_step)
     diffusion = DiffusionSchedule(args.timesteps, schedule=args.beta_schedule).to(device)
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
@@ -216,6 +222,12 @@ def train(args):
             with amp_ctx:
                 pred_v = model(x_t, t, cond)
                 loss = F.mse_loss(pred_v, v_target)
+                if args.temporal_loss_weight > 0:
+                    pred_x0 = diffusion.predict_x0_from_v(x_t, pred_v, t)
+                    pred_dt = pred_x0[:, :, 1:] - pred_x0[:, :, :-1]
+                    target_dt = clip[:, :, 1:] - clip[:, :, :-1]
+                    temporal_loss = F.l1_loss(pred_dt, target_dt)
+                    loss = loss + args.temporal_loss_weight * temporal_loss
 
             opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
@@ -252,7 +264,13 @@ def train(args):
                 x_t, noise = diffusion.forward_noise(clip, t)
                 v_target = diffusion.velocity_target(clip, noise, t)
                 pred_v = model(x_t, t, cond)
-                val_losses.append(F.mse_loss(pred_v, v_target).item())
+                val_loss = F.mse_loss(pred_v, v_target)
+                if args.temporal_loss_weight > 0:
+                    pred_x0 = diffusion.predict_x0_from_v(x_t, pred_v, t)
+                    pred_dt = pred_x0[:, :, 1:] - pred_x0[:, :, :-1]
+                    target_dt = clip[:, :, 1:] - clip[:, :, :-1]
+                    val_loss = val_loss + args.temporal_loss_weight * F.l1_loss(pred_dt, target_dt)
+                val_losses.append(val_loss.item())
 
         val_loss_epoch = float(np.mean(val_losses)) if val_losses else 0.0
 
@@ -334,25 +352,30 @@ def build_parser():
     p.add_argument("--data_root", type=str, default="data")
     p.add_argument("--val_ratio", type=float, default=0.01)
     p.add_argument("--out_dir", type=str, default="outputs/train")
-    p.add_argument("--T", type=int, default=16)
-    p.add_argument("--size", type=int, default=128)
-    p.add_argument("--batch_size", type=int, default=6)
+    p.add_argument("--T", type=int, default=8)
+    p.add_argument("--size", type=int, default=64)
+    p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--lr", type=float, default=1e-4)
-    p.add_argument("--epochs", type=int, default=80)
+    p.add_argument("--epochs", type=int, default=30)
     p.add_argument("--timesteps", type=int, default=1000)
     p.add_argument("--beta_schedule", type=str, default="cosine", choices=["cosine", "linear"])
-    p.add_argument("--cfg_drop_prob", type=float, default=0.1)
-    p.add_argument("--ema_decay", type=float, default=0.99995)
+    p.add_argument("--cfg_drop_prob", type=float, default=0.15)
+    p.add_argument("--ema_decay", type=float, default=0.999)
+    p.add_argument("--ema_update_after_step", type=int, default=100)
+    p.add_argument("--base_channels", type=int, default=64)
+    p.add_argument("--channel_mults", type=int, nargs="+", default=[1, 2, 4])
+    p.add_argument("--res_blocks", type=int, default=2)
+    p.add_argument("--temporal_loss_weight", type=float, default=0.02)
     p.add_argument("--log_every", type=int, default=20)
-    p.add_argument("--num_workers", type=int, default=8)
+    p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--max_videos", type=int, default=None)
     p.add_argument("--max_steps", type=int, default=0)
     p.add_argument("--grad_clip", type=float, default=1.0)
-    p.add_argument("--amp", action="store_true")
+    p.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--shape_check", action="store_true")
     p.add_argument("--overfit_16", action="store_true")
-    p.add_argument("--vis_every", type=int, default=5)
+    p.add_argument("--vis_every", type=int, default=1)
     p.add_argument("--vis_guidance_scale", type=float, default=1.5)
     p.add_argument("--vis_steps", type=int, default=50)
     p.add_argument("--tensorboard", action="store_true")
