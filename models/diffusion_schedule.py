@@ -54,10 +54,10 @@ class DiffusionSchedule:
         s = self.sqrt_one_minus_alpha_bar[t].view(b, 1, 1, 1, 1)
         return a, s
 
-    def forward_noise(self, x0: torch.Tensor, t: torch.Tensor):
-        offset = 0.1
+    def forward_noise(self, x0: torch.Tensor, t: torch.Tensor, noise_offset: float = 0.0):
         noise = torch.randn_like(x0)
-        noise = noise + offset * torch.randn(x0.shape[0], x0.shape[1], 1, 1, 1, device=x0.device)
+        if noise_offset > 0:
+            noise = noise + noise_offset * torch.randn(x0.shape[0], x0.shape[1], 1, 1, 1, device=x0.device)
         a, s = self._expand(x0, t)
         xt = a * x0 + s * noise
         return xt, noise
@@ -75,16 +75,17 @@ class DiffusionSchedule:
         return s * xt + a * v
 
     @torch.no_grad()
-    def ddim_step_from_v(self, x_t: torch.Tensor, pred_v: torch.Tensor, t: torch.Tensor, t_prev: torch.Tensor, eta: float = 0.0) -> torch.Tensor:
+    def ddim_step_from_v(self, x_t: torch.Tensor, pred_v: torch.Tensor, t: torch.Tensor, t_prev: torch.Tensor, eta: float = 0.0, dynamic_threshold: bool = False) -> torch.Tensor:
         b = x_t.shape[0]
         alpha_bar_t = self.alpha_bar[t].view(b, 1, 1, 1, 1)
         alpha_bar_prev = self.alpha_bar[t_prev.clamp(min=0)].view(b, 1, 1, 1, 1)
 
         x0_pred = self.predict_x0_from_v(x_t, pred_v, t)
-        s = torch.quantile(x0_pred.abs().reshape(x0_pred.shape[0], -1), 0.995, dim=1)
-        s = torch.maximum(s, torch.ones_like(s))
-        s = s[:, None, None, None, None]
-        x0_pred = torch.clamp(x0_pred, -s, s) / s
+        if dynamic_threshold:
+            s = torch.quantile(x0_pred.abs().reshape(x0_pred.shape[0], -1), 0.995, dim=1)
+            s = torch.maximum(s, torch.ones_like(s))
+            s = s[:, None, None, None, None]
+            x0_pred = torch.clamp(x0_pred, -s, s) / s
         eps_pred = self.predict_eps_from_v(x_t, pred_v, t)
 
         sigma = eta * torch.sqrt((1 - alpha_bar_prev) / (1 - alpha_bar_t)) * torch.sqrt(

@@ -5,6 +5,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from models.conditioning_encoder import ConditioningEncoder
+
 
 def _group_count(channels: int) -> int:
     for g in (32, 16, 8, 4, 2, 1):
@@ -25,6 +27,35 @@ class SinusoidalPosEmb(nn.Module):
         emb = torch.exp(torch.arange(half, device=t.device) * -emb)
         emb = t.float()[:, None] * emb[None, :]
         return torch.cat([emb.sin(), emb.cos()], dim=-1)
+
+
+class EndpointFeatureFusion(nn.Module):
+    """Fuse start/end 2D endpoint features into a single conditional map."""
+
+    def __init__(self, feat_ch: int, out_ch: int):
+        super().__init__()
+        self.fuse = nn.Sequential(
+            nn.Conv2d(feat_ch * 2, out_ch, kernel_size=1),
+            nn.GroupNorm(_group_count(out_ch), out_ch),
+            nn.SiLU(),
+        )
+
+    def forward(self, start_feat: torch.Tensor, end_feat: torch.Tensor) -> torch.Tensor:
+        return self.fuse(torch.cat([start_feat, end_feat], dim=1))
+
+
+class FiLMInjection(nn.Module):
+    """FiLM-like conditioning injection from 2D endpoint feature into 3D feature maps."""
+
+    def __init__(self, cond_ch: int, target_ch: int):
+        super().__init__()
+        self.to_scale = nn.Conv2d(cond_ch, target_ch, kernel_size=1)
+        self.to_shift = nn.Conv2d(cond_ch, target_ch, kernel_size=1)
+
+    def forward(self, x: torch.Tensor, cond_feat_2d: torch.Tensor) -> torch.Tensor:
+        scale = self.to_scale(cond_feat_2d).unsqueeze(2)
+        shift = self.to_shift(cond_feat_2d).unsqueeze(2)
+        return x * (1.0 + scale) + shift
 
 
 class ResBlock3D(nn.Module):
@@ -49,8 +80,6 @@ class ResBlock3D(nn.Module):
 
 
 class TemporalSelfAttention(nn.Module):
-    """Temporal attention at fixed spatial positions, memory-friendly for short clips."""
-
     def __init__(self, channels: int, heads: int = 4):
         super().__init__()
         self.norm = nn.GroupNorm(_group_count(channels), channels)
@@ -108,21 +137,37 @@ class UpBlock(nn.Module):
 
 
 class VideoUNet3DConditional(nn.Module):
-    """Compact grayscale first-frame conditioned 3D U-Net (v-prediction)."""
+    """Compact endpoint-conditioned 3D U-Net for middle-frame denoising."""
 
     def __init__(
         self,
         in_channels: int = 1,
         cond_channels: int = 1,
-        base_channels: int = 64,
+        base_channels: int = 96,
         channel_mult: Iterable[int] = (1, 2, 4),
         num_res_blocks: int = 2,
-        temporal_attn_levels: Iterable[int] = (2,),
+        temporal_attn_levels: Iterable[int] = (1, 2),
+        cond_injection_mode: str = "film",
+        endpoint_fusion_mode: str = "concat_proj",
     ):
         super().__init__()
+        if cond_injection_mode != "film":
+            raise ValueError("Only cond_injection_mode='film' is supported.")
+        if endpoint_fusion_mode != "concat_proj":
+            raise ValueError("Only endpoint_fusion_mode='concat_proj' is supported.")
+
         channel_mult = list(channel_mult)
         self.in_channels = in_channels
         self.cond_channels = cond_channels
+        self.temporal_attn_levels = tuple(temporal_attn_levels)
+        self.cond_injection_mode = cond_injection_mode
+        self.endpoint_fusion_mode = endpoint_fusion_mode
+
+        self.cond_encoder = ConditioningEncoder(
+            in_channels=cond_channels,
+            base_channels=base_channels,
+            channel_mult=channel_mult,
+        )
 
         time_dim = base_channels * 4
         self.time_mlp = nn.Sequential(
@@ -132,28 +177,43 @@ class VideoUNet3DConditional(nn.Module):
             nn.Linear(time_dim, time_dim),
         )
 
-        input_ch = in_channels + cond_channels
+        input_ch = in_channels + cond_channels * 2
         self.in_conv = nn.Conv3d(input_ch, base_channels, 3, padding=1)
 
         level_channels: List[int] = [base_channels * mult for mult in channel_mult]
 
+        self.stem_fuse = EndpointFeatureFusion(level_channels[0], level_channels[0])
+        self.stem_inject = FiLMInjection(level_channels[0], base_channels)
+
         self.down_blocks = nn.ModuleList()
+        self.down_fuse = nn.ModuleList()
+        self.down_injects = nn.ModuleList()
+        self.skip_injects = nn.ModuleList()
+
         prev_ch = base_channels
+        attn_levels_set = set(temporal_attn_levels)
         for level_idx, out_ch in enumerate(level_channels):
-            use_attn = level_idx in set(temporal_attn_levels)
+            use_attn = level_idx in attn_levels_set
+            self.down_fuse.append(EndpointFeatureFusion(level_channels[level_idx], level_channels[level_idx]))
+            self.down_injects.append(FiLMInjection(level_channels[level_idx], prev_ch))
             self.down_blocks.append(DownBlock(prev_ch, out_ch, time_dim, num_res_blocks, with_temporal_attn=use_attn))
+            self.skip_injects.append(FiLMInjection(level_channels[level_idx], out_ch))
             prev_ch = out_ch
 
+        self.mid_fuse = EndpointFeatureFusion(level_channels[-1], level_channels[-1])
+        self.mid_inject = FiLMInjection(level_channels[-1], prev_ch)
         self.mid1 = ResBlock3D(prev_ch, prev_ch, time_dim)
         self.mid_attn = TemporalSelfAttention(prev_ch, heads=4)
         self.mid2 = ResBlock3D(prev_ch, prev_ch, time_dim)
 
         self.up_blocks = nn.ModuleList()
+        self.up_injects = nn.ModuleList()
         for level_idx in reversed(range(len(level_channels))):
             skip_ch = level_channels[level_idx]
             out_ch = skip_ch
-            use_attn = level_idx in set(temporal_attn_levels)
+            use_attn = level_idx in attn_levels_set
             self.up_blocks.append(UpBlock(prev_ch, skip_ch, out_ch, time_dim, num_res_blocks, with_temporal_attn=use_attn))
+            self.up_injects.append(FiLMInjection(level_channels[level_idx], out_ch))
             prev_ch = out_ch
 
         self.out = nn.Sequential(
@@ -162,23 +222,42 @@ class VideoUNet3DConditional(nn.Module):
             nn.Conv3d(prev_ch, in_channels, 3, padding=1),
         )
 
-    def forward(self, x_t: torch.Tensor, timestep: torch.Tensor, cond_first_frame: torch.Tensor) -> torch.Tensor:
-        cond_video = cond_first_frame.unsqueeze(2).repeat(1, 1, x_t.shape[2], 1, 1)
-        x = torch.cat([x_t, cond_video], dim=1)
+    def _fuse_endpoint_pyramids(self, start_frame: torch.Tensor, end_frame: torch.Tensor):
+        start_feats = self.cond_encoder(start_frame)
+        end_feats = self.cond_encoder(end_frame)
 
+        fused_stem = self.stem_fuse(start_feats["stem"], end_feats["stem"])
+        fused_down = []
+        for i, fuse in enumerate(self.down_fuse):
+            fused_down.append(fuse(start_feats["down"][i], end_feats["down"][i]))
+        fused_mid = self.mid_fuse(start_feats["mid"], end_feats["mid"])
+        return fused_stem, fused_down, fused_mid
+
+    def forward(self, x_t: torch.Tensor, timestep: torch.Tensor, cond_start_frame: torch.Tensor, cond_end_frame: torch.Tensor) -> torch.Tensor:
+        start_video = cond_start_frame.unsqueeze(2).repeat(1, 1, x_t.shape[2], 1, 1)
+        end_video = cond_end_frame.unsqueeze(2).repeat(1, 1, x_t.shape[2], 1, 1)
+        fused_stem, fused_down, fused_mid = self._fuse_endpoint_pyramids(cond_start_frame, cond_end_frame)
+
+        x = torch.cat([x_t, start_video, end_video], dim=1)
         t_emb = self.time_mlp(timestep)
         x = self.in_conv(x)
+        x = self.stem_inject(x, fused_stem)
 
         skips = []
-        for down in self.down_blocks:
+        for level_idx, down in enumerate(self.down_blocks):
+            x = self.down_injects[level_idx](x, fused_down[level_idx])
             x, skip = down(x, t_emb)
+            skip = self.skip_injects[level_idx](skip, fused_down[level_idx])
             skips.append(skip)
 
+        x = self.mid_inject(x, fused_mid)
         x = self.mid1(x, t_emb)
         x = self.mid_attn(x)
         x = self.mid2(x, t_emb)
 
-        for up in self.up_blocks:
+        for i, up in enumerate(self.up_blocks):
+            level_idx = len(self.up_blocks) - 1 - i
             x = up(x, skips.pop(), t_emb)
+            x = self.up_injects[i](x, fused_down[level_idx])
 
         return self.out(x)
