@@ -21,7 +21,7 @@ from utils.diagnostics import save_training_curves
 from utils.distributed import cleanup_distributed, get_world_size, init_distributed, is_main_process
 from utils.io import save_mp4
 from utils.logger import TrainLogger
-
+from tqdm.auto import tqdm
 
 torch.backends.cudnn.benchmark = True
 
@@ -211,7 +211,14 @@ def train(args):
             train_sampler.set_epoch(epoch)
         model.train()
         epoch_losses = []
+        pbar = tqdm(
+            train_loader,
+            disable=not is_main_process(),
+            desc=f"epoch {epoch+1}/{args.epochs}",
+            leave=False,
+        )
 
+        for batch in pbar:
         for batch in train_loader:
             cond = batch["cond"].to(device, non_blocking=True)
             clip = batch["clip"].to(device, non_blocking=True)
@@ -248,9 +255,13 @@ def train(args):
                     p_ema.data.mul_(ema_decay).add_(p.data, alpha=1 - ema_decay)
             global_step += 1
             epoch_losses.append(loss.item())
-
-            if global_step % args.log_every == 0 and is_main_process():
-                print(f"epoch={epoch+1} step={global_step} loss={loss.item():.6f} diffusion={diffusion_loss.item():.6f} temporal={temp_loss.item():.6f}")
+            pbar.set_postfix({
+                "loss": f"{loss.item():.4f}",
+                "diff": f"{diffusion_loss.item():.4f}",
+                "temp": f"{temp_loss.item():.4f}",
+            })
+            #if global_step % args.log_every == 0 and is_main_process():
+            #    print(f"epoch={epoch+1} step={global_step} loss={loss.item():.6f} diffusion={diffusion_loss.item():.6f} temporal={temp_loss.item():.6f}")
 
             if args.max_steps > 0 and global_step >= args.max_steps:
                 break
