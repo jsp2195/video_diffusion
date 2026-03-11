@@ -5,7 +5,6 @@ from contextlib import nullcontext
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
@@ -48,6 +47,11 @@ def temporal_smoothness_loss(x: torch.Tensor) -> torch.Tensor:
     if x.shape[2] < 2:
         return torch.tensor(0.0, device=x.device, dtype=x.dtype)
     return (x[:, :, 1:] - x[:, :, :-1]).abs().mean()
+
+
+def weighted_diffusion_loss(pred_v: torch.Tensor, target_v: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+    per_example = (pred_v - target_v).pow(2).mean(dim=(1, 2, 3, 4))
+    return (per_example * weights).mean()
 
 
 @torch.no_grad()
@@ -220,7 +224,8 @@ def train(args):
             amp_ctx = torch.cuda.amp.autocast(enabled=args.amp) if torch.cuda.is_available() else nullcontext()
             with amp_ctx:
                 pred_v = model(x_t, t, cond)
-                diffusion_loss = F.mse_loss(pred_v, v_target)
+                min_snr_w = diffusion.min_snr_weight(t)
+                diffusion_loss = weighted_diffusion_loss(pred_v, v_target, min_snr_w)
                 pred_x0 = diffusion.predict_x0_from_v(x_t, pred_v, t)
                 temp_loss = temporal_smoothness_loss(pred_x0)
                 loss = diffusion_loss + args.lambda_temporal * temp_loss
@@ -255,7 +260,8 @@ def train(args):
                 x_t, noise = diffusion.forward_noise(clip, t)
                 v_target = diffusion.velocity_target(clip, noise, t)
                 pred_v = model(x_t, t, cond)
-                diffusion_loss = F.mse_loss(pred_v, v_target)
+                min_snr_w = diffusion.min_snr_weight(t)
+                diffusion_loss = weighted_diffusion_loss(pred_v, v_target, min_snr_w)
                 pred_x0 = diffusion.predict_x0_from_v(x_t, pred_v, t)
                 temp_loss = temporal_smoothness_loss(pred_x0)
                 val_losses.append((diffusion_loss + args.lambda_temporal * temp_loss).item())

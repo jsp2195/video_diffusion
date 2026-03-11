@@ -17,6 +17,8 @@ def cosine_beta_schedule(timesteps: int, s: float = 0.008) -> torch.Tensor:
 class DiffusionSchedule:
     timesteps: int
     schedule: str = "cosine"
+    noise_offset: float = 0.1
+    min_snr_gamma: float = 5.0
 
     def __post_init__(self):
         if self.schedule == "cosine":
@@ -56,9 +58,27 @@ class DiffusionSchedule:
 
     def forward_noise(self, x0: torch.Tensor, t: torch.Tensor):
         noise = torch.randn_like(x0)
+        if self.noise_offset > 0:
+            b, c = x0.shape[0], x0.shape[1]
+            noise = noise + self.noise_offset * torch.randn(b, c, 1, 1, 1, device=x0.device, dtype=x0.dtype)
         a, s = self._expand(x0, t)
         xt = a * x0 + s * noise
         return xt, noise
+
+    def min_snr_weight(self, t: torch.Tensor) -> torch.Tensor:
+        alpha_t = self.alpha_bar[t]
+        snr = alpha_t / (1.0 - alpha_t).clamp(min=1e-8)
+        gamma = torch.full_like(snr, self.min_snr_gamma)
+        w = torch.minimum(snr, gamma) / snr.clamp(min=1e-8)
+        return w
+
+    @staticmethod
+    def dynamic_threshold(x: torch.Tensor, p: float = 0.995) -> torch.Tensor:
+        b = x.shape[0]
+        flat = x.abs().reshape(b, -1)
+        s = torch.quantile(flat, p, dim=1)
+        s = s.clamp(min=1.0).view(b, 1, 1, 1, 1)
+        return x.clamp(-s, s) / s
 
     def velocity_target(self, x0: torch.Tensor, noise: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         a, s = self._expand(x0, t)
@@ -87,6 +107,7 @@ class DiffusionSchedule:
         noise = torch.randn_like(x_t)
         dir_xt = torch.sqrt((1 - alpha_bar_prev - sigma**2).clamp(min=0.0)) * eps_pred
         x_prev = torch.sqrt(alpha_bar_prev) * x0_pred + dir_xt + sigma * noise
+        x_prev = self.dynamic_threshold(x_prev)
 
         zero_mask = (t_prev < 0).float().view(b, 1, 1, 1, 1)
         return x_prev * (1 - zero_mask) + x0_pred * zero_mask
