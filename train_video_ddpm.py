@@ -220,7 +220,12 @@ def train(args):
             amp_ctx = torch.cuda.amp.autocast(enabled=args.amp) if torch.cuda.is_available() else nullcontext()
             with amp_ctx:
                 pred_v = model(x_t, t, cond)
-                diffusion_loss = F.mse_loss(pred_v, v_target)
+                mse = F.mse_loss(pred_v, v_target, reduction="none")
+                alpha_t = diffusion.alpha_bar[t].view(-1, 1, 1, 1, 1)
+                snr = alpha_t / (1.0 - alpha_t)
+                gamma = 5.0
+                weight = torch.minimum(snr, torch.full_like(snr, gamma)) / snr
+                diffusion_loss = (weight * mse).mean()
                 pred_x0 = diffusion.predict_x0_from_v(x_t, pred_v, t)
                 temp_loss = temporal_smoothness_loss(pred_x0)
                 loss = diffusion_loss + args.lambda_temporal * temp_loss
@@ -255,7 +260,12 @@ def train(args):
                 x_t, noise = diffusion.forward_noise(clip, t)
                 v_target = diffusion.velocity_target(clip, noise, t)
                 pred_v = model(x_t, t, cond)
-                diffusion_loss = F.mse_loss(pred_v, v_target)
+                mse = F.mse_loss(pred_v, v_target, reduction="none")
+                alpha_t = diffusion.alpha_bar[t].view(-1, 1, 1, 1, 1)
+                snr = alpha_t / (1.0 - alpha_t)
+                gamma = 5.0
+                weight = torch.minimum(snr, torch.full_like(snr, gamma)) / snr
+                diffusion_loss = (weight * mse).mean()
                 pred_x0 = diffusion.predict_x0_from_v(x_t, pred_v, t)
                 temp_loss = temporal_smoothness_loss(pred_x0)
                 val_losses.append((diffusion_loss + args.lambda_temporal * temp_loss).item())
