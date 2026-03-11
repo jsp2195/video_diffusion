@@ -108,7 +108,7 @@ class UpBlock(nn.Module):
 
 
 class VideoUNet3DConditional(nn.Module):
-    """Compact grayscale first-frame conditioned 3D U-Net (v-prediction)."""
+    """Compact grayscale first-frame conditioned 3D U-Net (v-prediction) for future-frame denoising."""
 
     def __init__(
         self,

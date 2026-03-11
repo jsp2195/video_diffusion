@@ -62,12 +62,18 @@ class KineticsVideoDataset(Dataset):
         self,
         files: List[str],
         num_frames: int = 16,
+        frame_stride: int = 1,
         size: int = 128,
         max_seconds: int = 10,
         cache_videos: bool = False,
     ):
         self.files = files
+        if num_frames < 2:
+            raise ValueError("num_frames must be >= 2 for first-frame-conditioned future prediction.")
+        if frame_stride < 1:
+            raise ValueError("frame_stride must be >= 1")
         self.num_frames = num_frames
+        self.frame_stride = frame_stride
         self.size = size
         self.max_seconds = max_seconds
         self.cache_videos = cache_videos
@@ -97,7 +103,7 @@ class KineticsVideoDataset(Dataset):
         max_len = min(n, int(self.max_seconds * fps) if fps > 0 else n)
         max_len = max(max_len, self.num_frames)
 
-        stride = np.random.choice([1, 2, 3])
+        stride = self.frame_stride
         span = (self.num_frames - 1) * stride + 1
         max_start = max(0, max_len - span)
         start = np.random.randint(0, max_start + 1) if max_start > 0 else 0
