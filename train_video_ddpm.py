@@ -14,10 +14,10 @@ from torch.utils.data.distributed import DistributedSampler
 from data.kinetics_video_dataset import KineticsVideoDataset, discover_and_split_videos
 from diffusion.schedule import DiffusionSchedule
 from metrics.fvd import compute_fvd
-from models.unet_video_cond import VideoUNetConditional
+from models.video_unet3d import VideoUNet3DConditional
 from utils.config import parse_with_config
 from utils.diagnostics import save_training_curves
-from utils.distributed import cleanup_distributed, get_rank, get_world_size, init_distributed, is_main_process
+from utils.distributed import cleanup_distributed, get_world_size, init_distributed, is_main_process
 from utils.ema import EMA
 from utils.io import save_mp4
 from utils.logger import TrainLogger
@@ -44,10 +44,16 @@ def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
     return model.module if isinstance(model, DDP) else model
 
 
+def temporal_smoothness_loss(x: torch.Tensor) -> torch.Tensor:
+    if x.shape[2] < 2:
+        return torch.tensor(0.0, device=x.device, dtype=x.dtype)
+    return (x[:, :, 1:] - x[:, :, :-1]).abs().mean()
+
+
 @torch.no_grad()
-def sample_video(model, diffusion, cond, t_len: int, size: int, steps: int, guidance_scale: float, eta: float = 0.0):
+def sample_video(model, diffusion, cond, t_len: int, size: int, channels: int, steps: int, guidance_scale: float, eta: float = 0.0):
     device = cond.device
-    x = torch.randn(1, 1, t_len, size, size, device=device)
+    x = torch.randn(1, channels, t_len, size, size, device=device)
     ddim_times = torch.linspace(diffusion.timesteps - 1, 0, steps, device=device).long()
     for i in range(len(ddim_times)):
         t = ddim_times[i].view(1)
@@ -57,6 +63,7 @@ def sample_video(model, diffusion, cond, t_len: int, size: int, steps: int, guid
         v_c = model(x, t, cond)
         v = v_u + guidance_scale * (v_c - v_u)
         x = diffusion.ddim_step_from_v(x, v, t, t_prev, eta=eta)
+        x[:, :, 0] = cond
     return x
 
 
@@ -78,9 +85,10 @@ def evaluate_fvd(ema_model, diffusion, val_ds, args, device):
             cond,
             t_len=args.T,
             size=args.size,
+            channels=args.channels,
             steps=args.vis_steps,
             guidance_scale=args.vis_guidance_scale,
-            eta=0.0,
+            eta=args.eta,
         )
         real_videos.append(real)
         gen_videos.append(gen)
@@ -91,7 +99,8 @@ def evaluate_fvd(ema_model, diffusion, val_ds, args, device):
 
 
 def train(args):
-    distributed, rank, local_rank, world_size = init_distributed()
+    distributed, rank, local_rank, _ = init_distributed()
+    world_size = get_world_size()
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
     set_seed(args.seed, rank)
 
@@ -109,12 +118,14 @@ def train(args):
         num_frames=args.T,
         size=args.size,
         cache_videos=args.cache_videos,
+        channels=args.channels,
     )
     val_ds = KineticsVideoDataset(
         val_files,
         num_frames=args.T,
         size=args.size,
         cache_videos=args.cache_videos,
+        channels=args.channels,
     )
 
     g = torch.Generator()
@@ -148,13 +159,14 @@ def train(args):
         drop_last=False,
     )
 
-    if len(train_loader) == 0:
-        raise RuntimeError("Training loader is empty. Dataset too small or batch_size too large.")
-
-    if len(val_loader) == 0:
-        raise RuntimeError("Validation loader is empty.")
-
-    model = VideoUNetConditional(in_channels=1, base_channels=32).to(device)
+    model = VideoUNet3DConditional(
+        in_channels=args.channels,
+        base_channels=128,
+        channel_mult=(1, 2, 4, 8),
+        num_res_blocks=2,
+        attention_heads=8,
+        max_temporal_length=max(32, args.T),
+    ).to(device)
     if distributed:
         model = DDP(model, device_ids=[local_rank] if torch.cuda.is_available() else None, output_device=local_rank if torch.cuda.is_available() else None, find_unused_parameters=False)
 
@@ -170,28 +182,20 @@ def train(args):
     os.makedirs(args.out_dir, exist_ok=True)
     start_epoch = 0
     global_step = 0
-    
+
     resume_ckpt = os.path.join(args.out_dir, "last.pt")
-
     if args.resume and os.path.exists(resume_ckpt):
-        if is_main_process():
-            print(f"Resuming training from {resume_ckpt}")
-
         ckpt = torch.load(resume_ckpt, map_location=device)
-
         unwrap_model(model).load_state_dict(ckpt["model_state_dict"])
         ema.load_state_dict(ckpt["ema_state_dict"])
         opt.load_state_dict(ckpt["optimizer_state_dict"])
         sched.load_state_dict(ckpt["scheduler_state_dict"])
         scaler.load_state_dict(ckpt["scaler_state_dict"])
-
         global_step = ckpt["step"]
         start_epoch = ckpt["epoch"]
-    
 
     fixed_rng = random.Random(args.seed)
     fixed_idx = fixed_rng.randrange(len(val_ds)) if len(val_ds) > 0 else None
-
     history = {"train_loss": [], "val_loss": [], "fvd": [], "fvd_epochs": []}
     best_val_loss = float("inf")
 
@@ -200,13 +204,10 @@ def train(args):
             train_sampler.set_epoch(epoch)
         model.train()
         epoch_losses = []
-        opt.zero_grad(set_to_none=True)
 
         for batch in train_loader:
             cond = batch["cond"].to(device, non_blocking=True)
             clip = batch["clip"].to(device, non_blocking=True)
-            assert clip.ndim == 5
-            assert cond.ndim == 4
 
             if args.cfg_drop_prob > 0:
                 mask = (torch.rand(cond.shape[0], device=device) < args.cfg_drop_prob).float().view(-1, 1, 1, 1)
@@ -219,11 +220,14 @@ def train(args):
             amp_ctx = torch.cuda.amp.autocast(enabled=args.amp) if torch.cuda.is_available() else nullcontext()
             with amp_ctx:
                 pred_v = model(x_t, t, cond)
-                loss = F.mse_loss(pred_v, v_target)
+                diffusion_loss = F.mse_loss(pred_v, v_target)
+                pred_x0 = diffusion.predict_x0_from_v(x_t, pred_v, t)
+                temp_loss = temporal_smoothness_loss(pred_x0)
+                loss = diffusion_loss + args.lambda_temporal * temp_loss
 
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             scaler.step(opt)
             scaler.update()
             opt.zero_grad(set_to_none=True)
@@ -232,13 +236,8 @@ def train(args):
             global_step += 1
             epoch_losses.append(loss.item())
 
-            if args.shape_check and global_step == 1 and is_main_process():
-                print(f"shape_check cond={tuple(cond.shape)} clip={tuple(clip.shape)} x_t={tuple(x_t.shape)} pred_v={tuple(pred_v.shape)}")
-
             if global_step % args.log_every == 0 and is_main_process():
-                print(f"epoch={epoch+1} step={global_step} loss={loss.item():.6f}")
-                logger.add_scalar("train/loss", float(loss.item()), global_step)
-                logger.add_scalar("learning_rate", float(opt.param_groups[0]["lr"]), global_step)
+                print(f"epoch={epoch+1} step={global_step} loss={loss.item():.6f} diffusion={diffusion_loss.item():.6f} temporal={temp_loss.item():.6f}")
 
             if args.max_steps > 0 and global_step >= args.max_steps:
                 break
@@ -256,7 +255,10 @@ def train(args):
                 x_t, noise = diffusion.forward_noise(clip, t)
                 v_target = diffusion.velocity_target(clip, noise, t)
                 pred_v = model(x_t, t, cond)
-                val_losses.append(F.mse_loss(pred_v, v_target).item())
+                diffusion_loss = F.mse_loss(pred_v, v_target)
+                pred_x0 = diffusion.predict_x0_from_v(x_t, pred_v, t)
+                temp_loss = temporal_smoothness_loss(pred_x0)
+                val_losses.append((diffusion_loss + args.lambda_temporal * temp_loss).item())
 
         val_loss_epoch = float(np.mean(val_losses)) if val_losses else 0.0
 
@@ -284,15 +286,10 @@ def train(args):
                 "config": vars(args),
             }
 
-            # save most recent checkpoint
             torch.save(ckpt, os.path.join(args.out_dir, "last.pt"))
-
-            # save best checkpoint
             if val_loss_epoch < best_val_loss:
                 best_val_loss = val_loss_epoch
                 torch.save(ckpt, os.path.join(args.out_dir, "best.pt"))
-            
-            logger.add_scalar("val/loss", val_loss_epoch, epoch + 1)
 
             if (epoch + 1) % args.vis_every == 0 and fixed_idx is not None:
                 preview_sample = val_ds[fixed_idx]
@@ -304,9 +301,10 @@ def train(args):
                     preview_cond,
                     t_len=args.T,
                     size=args.size,
-                    steps=args.vis_steps,
+                    channels=args.channels,
+                    steps=args.ddim_steps,
                     guidance_scale=args.vis_guidance_scale,
-                    eta=0.0,
+                    eta=args.eta,
                 )
                 preview_path = os.path.join(args.out_dir, f"epoch_{epoch+1:04d}_sample.mp4")
                 save_mp4(preview_video[0], preview_path, fps=8)
@@ -318,16 +316,13 @@ def train(args):
                 history["fvd"].append(fvd_score)
                 history["fvd_epochs"].append(epoch + 1)
                 print(f"epoch={epoch+1}, fvd_score={fvd_score:.4f}")
-                logger.add_scalar("metrics/fvd", fvd_score, epoch + 1)
 
             save_training_curves(history, args.out_dir)
 
         if distributed:
             dist.barrier()
-
         if args.max_steps > 0 and global_step >= args.max_steps:
             break
-
 
     logger.close()
     cleanup_distributed()
@@ -339,14 +334,16 @@ def build_parser():
     p.add_argument("--val_ratio", type=float, default=0.01)
     p.add_argument("--out_dir", type=str, default="outputs/train")
     p.add_argument("--T", type=int, default=16)
-    p.add_argument("--size", type=int, default=128)
+    p.add_argument("--size", type=int, default=96)
+    p.add_argument("--channels", type=int, default=1)
     p.add_argument("--batch_size", type=int, default=6)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--epochs", type=int, default=80)
     p.add_argument("--timesteps", type=int, default=1000)
     p.add_argument("--beta_schedule", type=str, default="cosine", choices=["cosine", "linear"])
     p.add_argument("--cfg_drop_prob", type=float, default=0.1)
-    p.add_argument("--ema_decay", type=float, default=0.99995)
+    p.add_argument("--ema_decay", type=float, default=0.9999)
+    p.add_argument("--lambda_temporal", type=float, default=0.05)
     p.add_argument("--log_every", type=int, default=20)
     p.add_argument("--num_workers", type=int, default=8)
     p.add_argument("--seed", type=int, default=42)
@@ -359,6 +356,8 @@ def build_parser():
     p.add_argument("--vis_every", type=int, default=5)
     p.add_argument("--vis_guidance_scale", type=float, default=1.5)
     p.add_argument("--vis_steps", type=int, default=50)
+    p.add_argument("--ddim_steps", type=int, default=50)
+    p.add_argument("--eta", type=float, default=0.0)
     p.add_argument("--tensorboard", action="store_true")
     p.add_argument("--log_dir", type=str, default="runs")
     p.add_argument("--eval_fvd_every", type=int, default=0)
