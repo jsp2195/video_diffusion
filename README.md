@@ -1,147 +1,141 @@
-# Grayscale Conditional Video DDPM (PyTorch MVP)
+# Lightweight First-Frame Conditioned Grayscale Video Diffusion (PyTorch)
 
-This repo refactors the single-image conditional DDPM baseline into a **first-frame conditioned grayscale video DDPM**.
+A practical baseline for generating short grayscale videos conditioned on a single first frame:
 
-## Core tensor contract
+\[
+  p(\text{video} \mid \text{first frame})
+\]
 
-- `cond_first_frame`: `[B,1,H,W]`
-- `clip`: `[B,1,T,H,W]`
-- `pred_noise = model(noisy_clip, t, cond_first_frame)`
-- `noisy_clip`: `[B,1,T,H,W]`
-- `t`: `[B]` (`int64`)
-- `pred_noise`: `[B,1,T,H,W]`
+This repo intentionally prioritizes **first success, speed, and debuggability** over SOTA quality.
 
-The training objective is unchanged: epsilon-prediction MSE (`MSE(pred_noise, noise)`).
+## Active default pipeline
 
-## Install dependencies
+- Pixel-space grayscale diffusion (not latent diffusion)
+- Compact conditional 3D U-Net (`models/video_unet3d.py`)
+- First-frame conditioning by repeat + concat (`[B,2,T,H,W]` model input)
+- DDPM training with **v-prediction**
+- DDIM sampling
+- EMA weights used for previews and inference by default
+- AMP enabled by default (`--amp`, disable with `--no-amp`)
+- Gradient clipping + classifier-free condition dropout
+- Optional tiny temporal smoothness auxiliary loss
+
+## Lightweight defaults
+
+- `size=64`
+- `T=8`
+- `base_channels=64`
+- `channel_mults=1 2 4`
+- `res_blocks=2`
+
+## Install
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
-pip install decord imageio[ffmpeg] numpy pillow
+pip install decord imageio[ffmpeg] numpy pillow pyyaml matplotlib
 ```
 
-## Dataset setup (optional downloader integration)
+## Dataset expectations
 
-If mp4 files already exist under `data_root/videos_val/**/*.mp4`, you can skip downloader setup entirely.
+The loader recursively discovers MP4s under `data_root`.
 
-### 1) Unzip downloader package
-
-```bash
-bash scripts/setup_kinetics_downloader.sh /mnt/data/kinetics-dataset-main.zip vendor/kinetics_downloader
-```
-
-### 2) Run downloader scripts (if needed)
-
-After unzip, inspect available scripts:
-
-```bash
-find vendor/kinetics_downloader -maxdepth 3 -type f \( -name '*.sh' -o -name 'k400_*' \)
-```
-
-Typical usage (depends on downloaded package contents):
-
-```bash
-bash vendor/kinetics_downloader/kinetics-dataset-main/download.sh
-bash vendor/kinetics_downloader/kinetics-dataset-main/extract.sh
-```
-
-Expected layout used by this training code:
+Examples of valid layouts:
 
 ```text
-data_root/
-  videos_val/
-    .../*.mp4
+/path/to/data_root/**/*.mp4
+/path/to/data_root/videos_val/**/*.mp4
 ```
 
-The loader discovers videos using recursive glob on `data_root/videos_val/**/*.mp4`.
+Returned dataset contract:
 
-## Smoke test
+- `cond`: `[1,H,W]` first frame
+- `clip`: `[1,T,H,W]` grayscale clip in `[-1,1]`
 
-```bash
-bash scripts/smoke_subset.sh /path/to/data_root ./outputs/smoke
-```
-
-Equivalent direct command:
+## First overfit run (recommended)
 
 ```bash
 python train_video_ddpm.py \
   --data_root /path/to/data_root \
-  --val_ratio 0.01 \
-  --max_videos 200 \
-  --max_steps 30 \
-  --shape_check
-```
-
-## Train
-
-```bash
-python train_video_ddpm.py \
-  --data_root /path/to/data_root \
-  --out_dir ./outputs/train \
-  --val_ratio 0.01 \
-  --T 16 \
-  --size 128 \
+  --out_dir ./outputs/overfit_test \
+  --max_videos 64 \
   --batch_size 2 \
-  --lr 1e-4 \
   --epochs 20 \
-  --timesteps 1000 \
-  --cfg_drop_prob 0.1 \
-  --ema_decay 0.999 \
-  --save_every 500 \
+  --max_steps 500 \
+  --vis_every 1 \
+  --num_workers 2
+```
+
+## Normal lightweight run
+
+```bash
+python train_video_ddpm.py \
+  --data_root /path/to/data_root \
+  --out_dir ./outputs/train_light \
+  --size 64 \
+  --T 8 \
+  --batch_size 8 \
+  --epochs 30 \
   --num_workers 4 \
-  --seed 42 \
+  --lr 1e-4 \
+  --vis_every 1 \
+  --cfg_drop_prob 0.15 \
   --amp
 ```
 
-Startup prints:
-- total discovered mp4 count
-- train/val split sizes
-- first 3 file paths
-
-Split rules:
-- deterministic shuffle using `--seed`
-- `--max_videos N`: applied **after shuffle**, taking first `N`
-- split then uses `--val_ratio`
-
-## Overfit sanity mode
+## Resume training
 
 ```bash
 python train_video_ddpm.py \
   --data_root /path/to/data_root \
-  --overfit_16 \
-  --max_steps 200 \
-  --batch_size 1
+  --out_dir ./outputs/train_light \
+  --resume
 ```
 
-## Sample (DDIM + CFG)
+`--resume` loads `out_dir/last.pt` (model, EMA, optimizer, scheduler, scaler, step/epoch, and model config).
 
-Using dataset-derived condition frame:
+## Sampling from checkpoint (EMA default)
+
+Using condition image:
 
 ```bash
 python sample_video_ddpm.py \
-  --ckpt ./outputs/train/last.pt \
+  --ckpt ./outputs/train_light/last.pt \
+  --input_image ./cond.png \
+  --out_dir ./outputs/sample \
+  --steps 40 \
+  --eta 0.0 \
+  --guidance_scale 1.8 \
+  --device cuda
+```
+
+Using random dataset condition frame:
+
+```bash
+python sample_video_ddpm.py \
+  --ckpt ./outputs/train_light/last.pt \
   --data_root /path/to/data_root \
   --out_dir ./outputs/sample \
-  --T 16 \
-  --size 128 \
-  --ddim_steps 50 \
-  --ddim_eta 0 \
-  --cfg_scale 2.0
+  --steps 40 \
+  --guidance_scale 1.8
 ```
 
-Using custom condition image:
-
-```bash
-python sample_video_ddpm.py \
-  --ckpt ./outputs/train/last.pt \
-  --cond_image ./my_cond.png \
-  --out_dir ./outputs/sample_custom \
-  --T 16 --size 128 --ddim_steps 50
-```
+Sampling **automatically reconstructs the trained architecture from checkpoint metadata** (`model_config`), so users do not need to re-enter architecture args.
 
 Outputs:
-- `cond.png`: first-frame condition
-- `sample.mp4`: generated grayscale clip
+
+- `cond.png`
+- `sample.mp4`
+
+## Metrics note (honesty)
+
+`metrics/fvd.py` provides a lightweight **proxy** metric (`fvd_proxy`) using a small internal encoder.
+It is useful for relative debugging trends only and is **not** canonical I3D-based FVD.
+
+## Limitations
+
+- Not SOTA quality; this is a compact baseline.
+- Motion quality depends heavily on data diversity and clip count.
+- Best workflow: overfit small subset first, then scale data and training length.

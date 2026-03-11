@@ -16,7 +16,10 @@ def save_training_curves(history: Dict[str, List[float]], out_dir: str):
         plt.plot(epochs, history["train_loss"], label="train_loss")
     if history.get("val_loss"):
         plt.plot(epochs, history["val_loss"], label="val_loss")
-    if history.get("fvd"):
+    if history.get("fvd_proxy"):
+        fvd_epochs = history.get("fvd_proxy_epochs", list(range(1, len(history["fvd_proxy"]) + 1)))
+        plt.plot(fvd_epochs, history["fvd_proxy"], label="fvd_proxy")
+    elif history.get("fvd"):
         fvd_epochs = history.get("fvd_epochs", list(range(1, len(history["fvd"]) + 1)))
         plt.plot(fvd_epochs, history["fvd"], label="fvd")
 

@@ -23,10 +23,16 @@ def discover_and_split_videos(
     seed: int,
     max_videos: int = None,
 ) -> Tuple[List[str], List[str], List[str], str]:
-    pattern = os.path.join(data_root, "videos_val", "**", "*.mp4")
-    files_all = sorted(glob.glob(pattern, recursive=True))
+    candidate_patterns = [
+        os.path.join(data_root, "**", "*.mp4"),
+        os.path.join(data_root, "**", "*.MP4"),
+    ]
+    files_set = set()
+    for pattern in candidate_patterns:
+        files_set.update(glob.glob(pattern, recursive=True))
+    files_all = sorted(files_set)
     if not files_all:
-        raise RuntimeError(f"No mp4 files discovered at {pattern}")
+        raise RuntimeError(f"No mp4 files discovered recursively under data_root={data_root}")
 
     files = list(files_all)
     rng = random.Random(seed)
@@ -48,7 +54,7 @@ def discover_and_split_videos(
     for p in files[:3]:
         print(f"  {p}")
 
-    return train_files, val_files, files, pattern
+    return train_files, val_files, files, data_root
 
 
 class KineticsVideoDataset(Dataset):
