@@ -3,7 +3,7 @@ import math
 import torch
 import torch.nn as nn
 
-from models.attention import SpatialAttention, TemporalAttention
+from models.attention import SpatialAttention
 from models.positional_encoding import FramePositionalEncoding
 from models.resblocks import VideoResBlock
 from models.temporal_modules import TemporalConvBlock
@@ -30,7 +30,6 @@ class VideoStage(nn.Module):
         self.block1 = VideoResBlock(in_ch, out_ch, time_dim)
         self.s_attn = SpatialAttention(out_ch, num_heads=4)
         self.frame_pe = FramePositionalEncoding(out_ch)
-        self.t_attn = TemporalAttention(out_ch, num_heads=4)
         self.t_conv = TemporalConvBlock(out_ch)
         self.block2 = VideoResBlock(out_ch, out_ch, time_dim)
 
@@ -38,14 +37,13 @@ class VideoStage(nn.Module):
         x = self.block1(x, t_emb)
         x = self.s_attn(x)
         x = self.frame_pe(x)
-        x = self.t_attn(x)
         x = self.t_conv(x)
         x = self.block2(x, t_emb)
         return x
 
 
 class VideoUNetConditional(nn.Module):
-    def __init__(self, in_channels: int = 1, base_channels: int = 32):
+    def __init__(self, in_channels: int = 1, base_channels: int = 96):
         super().__init__()
         time_dim = base_channels * 4
 

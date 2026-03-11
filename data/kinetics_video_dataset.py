@@ -91,12 +91,21 @@ class KineticsVideoDataset(Dataset):
         max_len = min(n, int(self.max_seconds * fps) if fps > 0 else n)
         max_len = max(max_len, self.num_frames)
 
-        stride = np.random.choice([1, 2, 3])
-        span = (self.num_frames - 1) * stride + 1
-        max_start = max(0, max_len - span)
-        start = np.random.randint(0, max_start + 1) if max_start > 0 else 0
+        frames = list(range(max_len))
+        stride = random.choice([1, 2])
+        if len(frames) < self.num_frames * stride:
+            stride = 1
 
-        idx = start + np.arange(self.num_frames) * stride
+        max_start = max(0, len(frames) - self.num_frames * stride)
+        start = random.randint(0, max_start) if max_start > 0 else 0
+
+        clip = frames[start:start + self.num_frames * stride:stride]
+        clip = clip[:self.num_frames]
+
+        if len(clip) < self.num_frames:
+            clip.extend([clip[-1]] * (self.num_frames - len(clip)))
+
+        idx = np.array(clip, dtype=np.int64)
         idx = np.clip(idx, 0, n - 1)
         return idx
 

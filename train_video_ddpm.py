@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
 from data.kinetics_video_dataset import KineticsVideoDataset, discover_and_split_videos
-from diffusion.schedule import DiffusionSchedule
+from diffusion.diffusion import DiffusionSchedule
 from metrics.fvd import compute_fvd
 from models.unet_video_cond import VideoUNetConditional
 from utils.config import parse_with_config
@@ -42,18 +42,18 @@ def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
 
 
 @torch.no_grad()
-def sample_video(model, diffusion, cond, t_len: int, size: int, steps: int, guidance_scale: float, eta: float = 0.0):
+def sample_video(model, diffusion, cond, t_len: int, size: int, steps: int, guidance_scale: float):
     device = cond.device
     x = torch.randn(1, 1, t_len, size, size, device=device)
-    ddim_times = torch.linspace(diffusion.timesteps - 1, 0, steps, device=device).long()
+    num_steps = 50
+    ddim_times = torch.linspace(diffusion.timesteps - 1, 0, num_steps, device=device).long()
     for i in range(len(ddim_times)):
         t = ddim_times[i].view(1)
-        t_prev = ddim_times[i + 1].view(1) if i < len(ddim_times) - 1 else torch.tensor([-1], device=device)
         zeros_cond = torch.zeros_like(cond)
         v_u = model(x, t, zeros_cond)
         v_c = model(x, t, cond)
         v = v_u + guidance_scale * (v_c - v_u)
-        x = diffusion.ddim_step_from_v(x, v, t, t_prev, eta=eta)
+        x = diffusion.ddim_step(x, t, v)
     return x
 
 
@@ -77,7 +77,6 @@ def evaluate_fvd(ema_model, diffusion, val_ds, args, device):
             size=args.size,
             steps=args.vis_steps,
             guidance_scale=args.vis_guidance_scale,
-            eta=0.0,
         )
         real_videos.append(real)
         gen_videos.append(gen)
@@ -91,6 +90,7 @@ def train(args):
     distributed, rank, local_rank, world_size = init_distributed()
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
     set_seed(args.seed, rank)
+    torch.backends.cudnn.benchmark = True
 
     train_files, val_files, _, _ = discover_and_split_videos(
         data_root=args.data_root,
@@ -151,7 +151,7 @@ def train(args):
     if len(val_loader) == 0:
         raise RuntimeError("Validation loader is empty.")
 
-    model = VideoUNetConditional(in_channels=1, base_channels=32).to(device)
+    model = VideoUNetConditional(in_channels=1, base_channels=96).to(device)
     if distributed:
         model = DDP(model, device_ids=[local_rank] if torch.cuda.is_available() else None, output_device=local_rank if torch.cuda.is_available() else None, find_unused_parameters=False)
 
@@ -210,7 +210,7 @@ def train(args):
 
             t = diffusion.sample_timesteps(cond.shape[0], device)
             x_t, noise = diffusion.forward_noise(clip, t)
-            v_target = diffusion.velocity_target(clip, noise, t)
+            v_target = diffusion.get_v(clip, noise, t)
 
             amp_ctx = torch.cuda.amp.autocast(enabled=args.amp) if torch.cuda.is_available() else nullcontext()
             with amp_ctx:
@@ -220,7 +220,10 @@ def train(args):
             opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                1.0,
+            )
             scaler.step(opt)
             scaler.update()
             sched.step()
@@ -250,7 +253,7 @@ def train(args):
                 clip = batch["clip"].to(device, non_blocking=True)
                 t = diffusion.sample_timesteps(cond.shape[0], device)
                 x_t, noise = diffusion.forward_noise(clip, t)
-                v_target = diffusion.velocity_target(clip, noise, t)
+                v_target = diffusion.get_v(clip, noise, t)
                 pred_v = model(x_t, t, cond)
                 val_losses.append(F.mse_loss(pred_v, v_target).item())
 
@@ -302,7 +305,6 @@ def train(args):
                     size=args.size,
                     steps=args.vis_steps,
                     guidance_scale=args.vis_guidance_scale,
-                    eta=0.0,
                 )
                 preview_path = os.path.join(args.out_dir, f"epoch_{epoch+1:04d}_sample.mp4")
                 save_mp4(preview_video[0], preview_path, fps=8)
