@@ -8,4 +8,5 @@ class TemporalConvBlock(nn.Module):
         self.conv = nn.Conv3d(channels, channels, kernel_size=(3, 1, 1), padding=(1, 0, 0))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.conv(x)
+        out = self.conv(x)
+        return x + 0.5 * out
