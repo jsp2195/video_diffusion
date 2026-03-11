@@ -26,7 +26,7 @@ def discover_and_split_videos(
     pattern = os.path.join(data_root, "videos_val", "**", "*.mp4")
     files_all = sorted(glob.glob(pattern, recursive=True))
     if not files_all:
-        raise RuntimeError(f"No mp4 files discovered at {pattern}")
+        raise RuntimeError(f"No mp4 files discovered at {data_root}/videos_val")
 
     files = list(files_all)
     rng = random.Random(seed)

@@ -23,6 +23,9 @@ from utils.io import save_mp4
 from utils.logger import TrainLogger
 
 
+torch.backends.cudnn.benchmark = True
+
+
 def set_seed(seed: int, rank: int = 0):
     full_seed = seed + rank
     random.seed(full_seed)
@@ -197,6 +200,7 @@ def train(args):
             train_sampler.set_epoch(epoch)
         model.train()
         epoch_losses = []
+        opt.zero_grad(set_to_none=True)
 
         for batch in train_loader:
             cond = batch["cond"].to(device, non_blocking=True)
@@ -217,12 +221,12 @@ def train(args):
                 pred_v = model(x_t, t, cond)
                 loss = F.mse_loss(pred_v, v_target)
 
-            opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(opt)
             scaler.update()
+            opt.zero_grad(set_to_none=True)
             sched.step()
             ema.update(unwrap_model(model))
             global_step += 1
