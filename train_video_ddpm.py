@@ -15,7 +15,7 @@ from torch.utils.data.distributed import DistributedSampler
 from data.kinetics_video_dataset import KineticsVideoDataset, discover_and_split_videos
 from diffusion.schedule import DiffusionSchedule
 from metrics.fvd import compute_fvd
-from models.video_unet3d import VideoUNet3DConditional
+from models.video_diffusion_transformer import VideoDiffusionTransformer
 from utils.config import parse_with_config
 from utils.diagnostics import save_training_curves
 from utils.distributed import cleanup_distributed, get_world_size, init_distributed, is_main_process
@@ -159,7 +159,7 @@ def train(args):
         drop_last=False,
     )
 
-    model = VideoUNet3DConditional(
+    model = VideoDiffusionTransformer(
         in_channels=args.channels,
         base_channels=128,
         channel_mult=(1, 2, 4, 8),

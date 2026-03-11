@@ -8,7 +8,7 @@ from PIL import Image
 
 from data.kinetics_video_dataset import KineticsVideoDataset, discover_and_split_videos
 from diffusion.schedule import DiffusionSchedule
-from models.video_unet3d import VideoUNet3DConditional
+from models.video_diffusion_transformer import VideoDiffusionTransformer
 from utils.io import save_cond_png, save_mp4
 
 
@@ -29,7 +29,7 @@ def sample(args):
     random.seed(args.seed)
 
     ckpt = torch.load(args.ckpt, map_location=device)
-    model = VideoUNet3DConditional(
+    model = VideoDiffusionTransformer(
         in_channels=args.channels,
         base_channels=128,
         channel_mult=(1, 2, 4, 8),
