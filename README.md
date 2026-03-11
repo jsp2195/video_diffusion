@@ -1,141 +1,153 @@
-# Lightweight First-Frame Conditioned Grayscale Video Diffusion (PyTorch)
+# Lightweight Multi-Endpoint-Context RGB Video Diffusion (PyTorch)
 
-A practical baseline for generating short grayscale videos conditioned on a single first frame:
+This repository is an MVP baseline for **motion-conditioned middle-frame generation**:
 
 \[
-  p(\text{video} \mid \text{first frame})
+  p(\text{frames}_{K..T-K-1} \mid \text{first }K\text{ frames},\ \text{last }K\text{ frames})
 \]
 
-This repo intentionally prioritizes **first success, speed, and debuggability** over SOTA quality.
+Default: `K = 2` (`--endpoint_context 2`).
 
-## Active default pipeline
+For `T=8`, the model observes frames `[0,1]` and `[6,7]`, and generates frames `[2,3,4,5]`.
 
-- Pixel-space grayscale diffusion (not latent diffusion)
-- Compact conditional 3D U-Net (`models/video_unet3d.py`)
-- First-frame conditioning by repeat + concat (`[B,2,T,H,W]` model input)
-- DDPM training with **v-prediction**
-- DDIM sampling
-- EMA weights used for previews and inference by default
-- AMP enabled by default (`--amp`, disable with `--no-amp`)
-- Gradient clipping + classifier-free condition dropout
-- Optional tiny temporal smoothness auxiliary loss
+## Active task (default everywhere)
 
-## Lightweight defaults
+- First `K` frames are fixed observed start context
+- Last `K` frames are fixed observed end context
+- Diffusion target is only the center span
+- Observed context frames are never denoised/regenerated
+
+Saved/generated clips are assembled exactly as:
+
+`[exact_start_context, generated_middle..., exact_end_context]`
+
+This setup is intentionally more constrained than one-image-to-video to reduce shimmer and endpoint morphing, and encourage visible short-horizon motion.
+
+Grayscale remains available as an optional mode (`--color_mode gray`), but RGB is the active MVP default for stronger object/background and identity cues.
+
+## Model architecture (lightweight, stronger conditioning)
+
+- Pixel-space RGB diffusion by default (no latent stage)
+- Compact 3D U-Net denoiser (`models/video_unet3d.py`)
+- Shared multiscale conditioning encoder (`models/conditioning_encoder.py`) applied to both start/end context clips
+- Endpoint feature fusion (`concat + 1x1 projection`) per scale
+- FiLM-style modulation at:
+  - stem
+  - each down block
+  - bottleneck
+  - each up block
+- Temporal attention active at multiple levels by default (`temporal_attn_levels=1 2`)
+- DDPM training + DDIM sampling + EMA
+
+## MVP defaults (single-GPU practical, RGB default)
 
 - `size=64`
 - `T=8`
-- `base_channels=64`
+- `endpoint_context=2`
+- `frame_stride=1`
+- `base_channels=96`
 - `channel_mults=1 2 4`
 - `res_blocks=2`
-
-## Install
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install --upgrade pip
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
-pip install decord imageio[ffmpeg] numpy pillow pyyaml matplotlib
-```
+- `temporal_attn_levels=1 2`
+- `cfg_drop_prob=0.08`
+- `temporal_loss_weight=0.0` (disabled)
+- `noise_offset=0.0` (disabled)
+- `dynamic_threshold=False` (disabled)
+- `color_mode=rgb` (default, recommended)
 
 ## Dataset expectations
 
-The loader recursively discovers MP4s under `data_root`.
+The loader recursively discovers MP4s under `data_root` and returns **RGB clips by default**:
 
-Examples of valid layouts:
+- `clip`: full clip `[3,T,H,W]` for default RGB (`[1,T,H,W]` only if `--color_mode gray`)
 
-```text
-/path/to/data_root/**/*.mp4
-/path/to/data_root/videos_val/**/*.mp4
-```
+Active split used in train/val/sample:
 
-Returned dataset contract:
+- `start_context = clip[:, :, :K]`
+- `middle_target = clip[:, :, K:-K]`
+- `end_context = clip[:, :, -K:]`
 
-- `cond`: `[1,H,W]` first frame
-- `clip`: `[1,T,H,W]` grayscale clip in `[-1,1]`
+`T` must satisfy `T > 2*K`.
 
-## First overfit run (recommended)
+## Commands
+
+### 1) First overfit run
 
 ```bash
 python train_video_ddpm.py \
   --data_root /path/to/data_root \
-  --out_dir ./outputs/overfit_test \
+  --out_dir ./outputs/overfit_motion_ctx2 \
   --max_videos 64 \
+  --size 64 \
+  --T 8 \
+  --endpoint_context 2 \
+  --frame_stride 1 \
+  --color_mode rgb \
   --batch_size 2 \
   --epochs 20 \
   --max_steps 500 \
+  --base_channels 96 \
+  --channel_mults 1 2 4 \
+  --temporal_attn_levels 1 2 \
+  --cfg_drop_prob 0.08 \
+  --temporal_loss_weight 0.0 \
   --vis_every 1 \
   --num_workers 2
 ```
 
-## Normal lightweight run
+### 2) Normal training run
 
 ```bash
 python train_video_ddpm.py \
   --data_root /path/to/data_root \
-  --out_dir ./outputs/train_light \
+  --out_dir ./outputs/train_motion_ctx2 \
   --size 64 \
   --T 8 \
+  --endpoint_context 2 \
+  --frame_stride 1 \
+  --color_mode rgb \
   --batch_size 8 \
   --epochs 30 \
   --num_workers 4 \
   --lr 1e-4 \
+  --base_channels 96 \
+  --channel_mults 1 2 4 \
+  --temporal_attn_levels 1 2 \
+  --cfg_drop_prob 0.08 \
+  --temporal_loss_weight 0.0 \
   --vis_every 1 \
-  --cfg_drop_prob 0.15 \
   --amp
 ```
 
-## Resume training
+### 3) Resume run
 
 ```bash
 python train_video_ddpm.py \
   --data_root /path/to/data_root \
-  --out_dir ./outputs/train_light \
+  --out_dir ./outputs/train_motion_ctx2 \
   --resume
 ```
 
-`--resume` loads `out_dir/last.pt` (model, EMA, optimizer, scheduler, scaler, step/epoch, and model config).
-
-## Sampling from checkpoint (EMA default)
-
-Using condition image:
+### 4) Sample generation run (EMA default)
 
 ```bash
 python sample_video_ddpm.py \
-  --ckpt ./outputs/train_light/last.pt \
-  --input_image ./cond.png \
-  --out_dir ./outputs/sample \
+  --ckpt ./outputs/train_motion_ctx2/last.pt \
+  --start_images ./start_0.png ./start_1.png \
+  --end_images ./end_0.png ./end_1.png \
+  --endpoint_context 2 \
+  --color_mode rgb \
+  --out_dir ./outputs/sample_motion_ctx2 \
   --steps 40 \
   --eta 0.0 \
   --guidance_scale 1.8 \
   --device cuda
 ```
 
-Using random dataset condition frame:
-
-```bash
-python sample_video_ddpm.py \
-  --ckpt ./outputs/train_light/last.pt \
-  --data_root /path/to/data_root \
-  --out_dir ./outputs/sample \
-  --steps 40 \
-  --guidance_scale 1.8
-```
-
-Sampling **automatically reconstructs the trained architecture from checkpoint metadata** (`model_config`), so users do not need to re-enter architecture args.
-
-Outputs:
-
-- `cond.png`
-- `sample.mp4`
-
-## Metrics note (honesty)
-
-`metrics/fvd.py` provides a lightweight **proxy** metric (`fvd_proxy`) using a small internal encoder.
-It is useful for relative debugging trends only and is **not** canonical I3D-based FVD.
+(Alternative: omit `--start_images/--end_images` and pass `--data_root` to draw context clips from dataset videos.)
 
 ## Limitations
 
-- Not SOTA quality; this is a compact baseline.
-- Motion quality depends heavily on data diversity and clip count.
-- Best workflow: overfit small subset first, then scale data and training length.
+- This is still an MVP bridge generator, not unconstrained one-image-to-video.
+- Conservative or partial motion can still appear on difficult scenes.
+- Long horizons and complex camera movement remain challenging.

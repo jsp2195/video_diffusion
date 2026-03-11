@@ -17,11 +17,17 @@ def save_cond_png(cond: torch.Tensor, path: str):
     arr = denorm_to_uint8(cond)
 
     if arr.ndim == 4:  # (B,C,H,W)
-        arr = arr[0, 0]
-    elif arr.ndim == 3:  # (C,H,W)
         arr = arr[0]
 
-    Image.fromarray(arr, mode="L").save(path)
+    if arr.ndim != 3:
+        raise ValueError(f"Expected cond tensor with shape (C,H,W) or (B,C,H,W), got {arr.shape}")
+
+    if arr.shape[0] == 1:
+        Image.fromarray(arr[0], mode="L").save(path)
+    elif arr.shape[0] == 3:
+        Image.fromarray(np.transpose(arr, (1, 2, 0)), mode="RGB").save(path)
+    else:
+        raise ValueError(f"Expected cond channels 1 or 3, got {arr.shape[0]}")
 
 
 def _normalize_clip_layout(arr: np.ndarray) -> np.ndarray:

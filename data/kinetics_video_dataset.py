@@ -10,13 +10,6 @@ from PIL import Image
 from torch.utils.data import Dataset
 
 
-def _to_gray(rgb: np.ndarray) -> np.ndarray:
-    r = rgb[..., 0]
-    g = rgb[..., 1]
-    b = rgb[..., 2]
-    return 0.2989 * r + 0.5870 * g + 0.1140 * b
-
-
 def discover_and_split_videos(
     data_root: str,
     val_ratio: float,
@@ -62,15 +55,25 @@ class KineticsVideoDataset(Dataset):
         self,
         files: List[str],
         num_frames: int = 16,
+        frame_stride: int = 1,
         size: int = 128,
         max_seconds: int = 10,
         cache_videos: bool = False,
+        color_mode: str = "rgb",
     ):
         self.files = files
+        if num_frames < 2:
+            raise ValueError("num_frames must be >= 2 for video prediction.")
+        if frame_stride < 1:
+            raise ValueError("frame_stride must be >= 1")
         self.num_frames = num_frames
+        self.frame_stride = frame_stride
         self.size = size
         self.max_seconds = max_seconds
+        if color_mode not in ("rgb", "gray"):
+            raise ValueError("color_mode must be one of: rgb, gray")
         self.cache_videos = cache_videos
+        self.color_mode = color_mode
         self._vr_cache: Dict[str, VideoReader] = {}
         self._meta_cache: Dict[str, Tuple[int, float]] = {}
 
@@ -97,7 +100,7 @@ class KineticsVideoDataset(Dataset):
         max_len = min(n, int(self.max_seconds * fps) if fps > 0 else n)
         max_len = max(max_len, self.num_frames)
 
-        stride = np.random.choice([1, 2, 3])
+        stride = self.frame_stride
         span = (self.num_frames - 1) * stride + 1
         max_start = max(0, max_len - span)
         start = np.random.randint(0, max_start + 1) if max_start > 0 else 0
@@ -136,16 +139,18 @@ class KineticsVideoDataset(Dataset):
                 processed = []
                 for f in frames:
                     f = self._resize_crop(f)
-                    gray = _to_gray(f)
-                    processed.append(gray)
+                    if self.color_mode == "gray":
+                        gray = (0.2989 * f[..., 0] + 0.5870 * f[..., 1] + 0.1140 * f[..., 2]).astype(np.float32)
+                        processed.append(gray[..., None])
+                    else:
+                        processed.append(f.astype(np.float32))
 
-                frames = np.stack(processed)  # [T,H,W]
+                frames = np.stack(processed)  # [T,H,W,C]
+                frames = torch.from_numpy(frames).permute(3, 0, 1, 2).float() / 127.5 - 1
+                # [C,T,H,W]
 
-                frames = torch.from_numpy(frames).unsqueeze(0).float() / 127.5 - 1
-                # [1,T,H,W]
-
-                cond = frames[:, 0]  # [1,H,W]
-                clip = frames        # [1,T,H,W]
+                cond = frames[:, 0]  # [C,H,W]
+                clip = frames        # [C,T,H,W]
 
                 return {
                     "cond": cond,
