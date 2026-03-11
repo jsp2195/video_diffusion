@@ -142,17 +142,23 @@ def sample(args):
     diffusion = DiffusionSchedule(args.timesteps, schedule=args.beta_schedule).to(device)
 
     middle_len = args.T - 2 * args.endpoint_context
-    x = torch.randn(1, 1, middle_len, args.size, args.size, device=device)
+    C = cond_start.shape[1]
+    x = torch.randn(1, C, middle_len, args.size, args.size, device=device)
     ddim_times = torch.linspace(args.timesteps - 1, 0, args.steps, device=device).long()
 
     for i in range(len(ddim_times)):
         t = ddim_times[i].view(1)
         t_prev = ddim_times[i + 1].view(1) if i < len(ddim_times) - 1 else torch.tensor([-1], device=device)
-
-        zeros_start = torch.zeros_like(cond_start)
-        zeros_end = torch.zeros_like(cond_end)
+        B, C, K, H, W = cond_start.shape
+        
+        cond_start = cond_start.reshape(B, C * K, H, W)
+        cond_end   = cond_end.reshape(B, C * K, H, W)
+        
+        zeros_start = torch.zeros(B, C * K, H, W, device=device)
+        zeros_end   = torch.zeros(B, C * K, H, W, device=device)
+        
         v_uncond = model(x, t, zeros_start, zeros_end)
-        v_cond = model(x, t, cond_start, cond_end)
+        v_cond   = model(x, t, cond_start, cond_end)
         v = v_uncond + args.guidance_scale * (v_cond - v_uncond)
 
         x = diffusion.ddim_step_from_v(x, v, t, t_prev, eta=args.eta, dynamic_threshold=args.dynamic_threshold)

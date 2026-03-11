@@ -102,7 +102,8 @@ def make_model_from_config(model_cfg: Dict) -> VideoUNet3DConditional:
 @torch.no_grad()
 def sample_video(model, diffusion, cond_start_ctx, cond_end_ctx, middle_len: int, size: int, steps: int, guidance_scale: float, eta: float = 0.0, dynamic_threshold: bool = False):
     device = cond_start_ctx.device
-    x = torch.randn(1, 1, middle_len, size, size, device=device)
+    C = cond_start_ctx.shape[1]
+    x = torch.randn(1, C, middle_len, size, size, device=device)
     ddim_times = torch.linspace(diffusion.timesteps - 1, 0, steps, device=device).long()
     for i in range(len(ddim_times)):
         t = ddim_times[i].view(1)
