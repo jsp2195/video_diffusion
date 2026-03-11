@@ -90,8 +90,9 @@ class VideoUNet3DConditional(nn.Module):
         )
 
         self.cond_encoder = ConditioningEncoder(in_channels=in_channels, out_channels=cond_channels)
+        self.frame_encoder = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1)
 
-        self.in_conv = nn.Conv3d(in_channels, ch0, 3, padding=1)
+        self.in_conv = nn.Conv3d(in_channels * 2, ch0, 3, padding=1)
 
         self.enc0a = ResBlock3D(ch0, ch0, time_dim, max_temporal_length)
         self.attn0a = TemporalAttention(ch0, cond_channels, heads=attention_heads)
@@ -161,7 +162,10 @@ class VideoUNet3DConditional(nn.Module):
         cond_tokens = self._cond_tokens(cond_first_frame)
         t_emb = self.time_mlp(timestep)
 
-        x = self.in_conv(x_t)
+        frame_feat = self.frame_encoder(cond_first_frame)
+        frame_feat = frame_feat.unsqueeze(2).repeat(1, 1, x_t.shape[2], 1, 1)
+        x = torch.cat([x_t, frame_feat], dim=1)
+        x = self.in_conv(x)
 
         x = self.attn0a(self.enc0a(x, t_emb), cond_tokens)
         x = self.attn0b(self.enc0b(x, t_emb), cond_tokens)
