@@ -5,6 +5,7 @@ import random
 import numpy as np
 import torch
 from PIL import Image
+import shutil
 
 from data.kinetics_video_dataset import KineticsVideoDataset, discover_and_split_videos
 from diffusion.schedule import DiffusionSchedule
@@ -98,72 +99,126 @@ def sample(args):
     np.random.seed(args.seed)
     random.seed(args.seed)
 
-    ckpt = torch.load(args.ckpt, map_location=device)
+    ckpt = torch.load(args.ckpt, map_location="cpu")
     model_cfg = infer_model_config_from_checkpoint(ckpt)
     model = build_model_from_cfg(model_cfg).to(device)
 
+    # ---- FIX: handle torch.compile checkpoints ----
+    def strip_compile_prefix(state):
+        return {k.replace("_orig_mod.", ""): v for k, v in state.items()}
+
     if args.use_raw_model:
-        model.load_state_dict(ckpt.get("model_state_dict", ckpt.get("model")))
+        state = ckpt.get("model_state_dict", ckpt.get("model"))
+        state = strip_compile_prefix(state)
+        model.load_state_dict(state)
     else:
         if "ema_state_dict" in ckpt:
-            model.load_state_dict(ckpt["ema_state_dict"]["model"])
+            state = ckpt["ema_state_dict"]["model"]
+            state = strip_compile_prefix(state)
+            model.load_state_dict(state)
         elif "ema" in ckpt and isinstance(ckpt["ema"], dict) and "model" in ckpt["ema"]:
-            model.load_state_dict(ckpt["ema"]["model"])
+            state = ckpt["ema"]["model"]
+            state = strip_compile_prefix(state)
+            model.load_state_dict(state)
         else:
             raise ValueError("Checkpoint has no EMA state. Use --use_raw_model to force raw weights.")
+
     model.eval()
 
     if args.T is None:
         args.T = int(model_cfg.get("T", ckpt.get("config", {}).get("T", 8)))
+
     if args.endpoint_context is None:
         args.endpoint_context = int(model_cfg.get("endpoint_context", ckpt.get("config", {}).get("endpoint_context", 2)))
+
     if args.endpoint_context < 1:
         raise ValueError("endpoint_context must be >= 1")
+
     if args.T <= 2 * args.endpoint_context:
-        raise ValueError("Resolved T must be > 2 * endpoint_context for middle-frame sampling.")
+        raise ValueError("Resolved T must be > 2 * endpoint_context")
+
     if args.frame_stride is None:
         args.frame_stride = int(model_cfg.get("frame_stride", ckpt.get("config", {}).get("frame_stride", 1)))
+
     if args.color_mode is None:
         args.color_mode = str(model_cfg.get("color_mode", ckpt.get("config", {}).get("color_mode", "rgb")))
 
+    # ---- conditioning frames ----
     if args.start_images and args.end_images:
         cond_start = load_cond_sequence(args.start_images, args.size, args.endpoint_context, args.color_mode)
         cond_end = load_cond_sequence(args.end_images, args.size, args.endpoint_context, args.color_mode)
     else:
-        train_files, _, _, _ = discover_and_split_videos(args.data_root, args.val_ratio, args.seed, args.max_videos)
-        ds = KineticsVideoDataset(train_files, num_frames=args.T, frame_stride=args.frame_stride, size=args.size, color_mode=args.color_mode)
-        sample_clip = ds[np.random.randint(0, len(ds))]["clip"].unsqueeze(0)
+        train_files, _, _, _ = discover_and_split_videos(
+            args.data_root, args.val_ratio, args.seed, args.max_videos
+        )
+
+        ds = KineticsVideoDataset(
+            train_files,
+            num_frames=args.T,
+            frame_stride=args.frame_stride,
+            size=args.size,
+            color_mode=args.color_mode,
+        )
+
+
+        sample_idx = np.random.randint(0, len(ds))
+        sample_item = ds[sample_idx]
+        sample_clip = sample_item["clip"].unsqueeze(0)
+
+        # attempt to recover original video path
+        original_video_path = None
+        if "video_path" in sample_item:
+            original_video_path = sample_item["video_path"]
+        elif hasattr(ds, "video_files"):
+            original_video_path = ds.video_files[sample_idx]
+        elif hasattr(ds, "files"):
+            original_video_path = ds.files[sample_idx]
         k = args.endpoint_context
         cond_start = sample_clip[:, :, :k]
         cond_end = sample_clip[:, :, -k:]
 
     cond_start = cond_start.to(device)
     cond_end = cond_end.to(device)
+
     diffusion = DiffusionSchedule(args.timesteps, schedule=args.beta_schedule).to(device)
 
     middle_len = args.T - 2 * args.endpoint_context
     C = cond_start.shape[1]
+
     x = torch.randn(1, C, middle_len, args.size, args.size, device=device)
+
     ddim_times = torch.linspace(args.timesteps - 1, 0, args.steps, device=device).long()
+    
+    B, C, K, H, W = cond_start.shape
+
 
     for i in range(len(ddim_times)):
         t = ddim_times[i].view(1)
-        t_prev = ddim_times[i + 1].view(1) if i < len(ddim_times) - 1 else torch.tensor([-1], device=device)
-        B, C, K, H, W = cond_start.shape
-        
-        cond_start = cond_start.reshape(B, C * K, H, W)
-        cond_end   = cond_end.reshape(B, C * K, H, W)
-        
-        zeros_start = torch.zeros(B, C * K, H, W, device=device)
-        zeros_end   = torch.zeros(B, C * K, H, W, device=device)
+        t_prev = (
+            ddim_times[i + 1].view(1)
+            if i < len(ddim_times) - 1
+            else torch.tensor([-1], device=device)
+        )
+
+        zeros_start = torch.zeros_like(cond_start)
+        zeros_end = torch.zeros_like(cond_end)
         
         v_uncond = model(x, t, zeros_start, zeros_end)
-        v_cond   = model(x, t, cond_start, cond_end)
+        v_cond = model(x, t, cond_start, cond_end)
+
         v = v_uncond + args.guidance_scale * (v_cond - v_uncond)
 
-        x = diffusion.ddim_step_from_v(x, v, t, t_prev, eta=args.eta, dynamic_threshold=args.dynamic_threshold)
+        x = diffusion.ddim_step_from_v(
+            x,
+            v,
+            t,
+            t_prev,
+            eta=args.eta,
+            dynamic_threshold=args.dynamic_threshold,
+        )
 
     os.makedirs(args.out_dir, exist_ok=True)
+
     if args.out_path:
         out_mp4 = args.out_path
         os.makedirs(os.path.dirname(out_mp4) or ".", exist_ok=True)
@@ -175,10 +230,17 @@ def sample(args):
     start_path = os.path.join(out_dir, "start_context.png")
     end_path = os.path.join(out_dir, "end_context.png")
 
-    full_clip = torch.cat([cond_start, x, cond_end], dim=2)
-    save_cond_png(cond_start[:, :, 0], start_path)
-    save_cond_png(cond_end[:, :, -1], end_path)
+    full_clip = torch.cat([cond_start.reshape(B, C, K, H, W), x, cond_end.reshape(B, C, K, H, W)], dim=2)
+
+    save_cond_png(cond_start.reshape(B, C, K, H, W)[:, :, 0], start_path)
+    save_cond_png(cond_end.reshape(B, C, K, H, W)[:, :, -1], end_path)
+
     save_mp4(full_clip, out_mp4, fps=args.fps)
+    # save original source video alongside generated sample
+    if 'original_video_path' in locals() and original_video_path is not None and os.path.exists(original_video_path):
+        original_out = os.path.join(out_dir, "original.mp4")
+        shutil.copy(original_video_path, original_out)
+        print(f"saved: {original_out}")
     print(f"saved: {start_path}")
     print(f"saved: {end_path}")
     print(f"saved: {out_mp4}")

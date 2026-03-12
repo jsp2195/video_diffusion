@@ -8,6 +8,11 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+
+torch.backends.cudnn.benchmark = True
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.set_float32_matmul_precision("high")
+
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
@@ -103,17 +108,37 @@ def make_model_from_config(model_cfg: Dict) -> VideoUNet3DConditional:
 def sample_video(model, diffusion, cond_start_ctx, cond_end_ctx, middle_len: int, size: int, steps: int, guidance_scale: float, eta: float = 0.0, dynamic_threshold: bool = False):
     device = cond_start_ctx.device
     C = cond_start_ctx.shape[1]
+
     x = torch.randn(1, C, middle_len, size, size, device=device)
+
     ddim_times = torch.linspace(diffusion.timesteps - 1, 0, steps, device=device).long()
+
     for i in range(len(ddim_times)):
         t = ddim_times[i].view(1)
-        t_prev = ddim_times[i + 1].view(1) if i < len(ddim_times) - 1 else torch.tensor([-1], device=device)
+        t_prev = (
+            ddim_times[i + 1].view(1)
+            if i < len(ddim_times) - 1
+            else torch.tensor([-1], device=device)
+        )
+
         zeros_start = torch.zeros_like(cond_start_ctx)
         zeros_end = torch.zeros_like(cond_end_ctx)
-        v_u = model(x, t, zeros_start, zeros_end)
-        v_c = model(x, t, cond_start_ctx, cond_end_ctx)
+
+        # clone() prevents CUDA graph overwrite from torch.compile
+        v_u = model(x, t, zeros_start, zeros_end).clone()
+        v_c = model(x, t, cond_start_ctx, cond_end_ctx).clone()
+
         v = v_u + guidance_scale * (v_c - v_u)
-        x = diffusion.ddim_step_from_v(x, v, t, t_prev, eta=eta, dynamic_threshold=dynamic_threshold)
+
+        x = diffusion.ddim_step_from_v(
+            x,
+            v,
+            t,
+            t_prev,
+            eta=eta,
+            dynamic_threshold=dynamic_threshold,
+        )
+
     return x
 
 
@@ -188,7 +213,8 @@ def train(args):
         sampler=train_sampler,
         num_workers=args.num_workers,
         pin_memory=True,
-        persistent_workers=args.num_workers > 0,
+        persistent_workers=True if args.num_workers > 0 else False,
+        prefetch_factor=4 if args.num_workers > 0 else None,
         worker_init_fn=seed_worker,
         generator=g,
         drop_last=True,
@@ -200,7 +226,8 @@ def train(args):
         sampler=val_sampler,
         num_workers=args.num_workers,
         pin_memory=True,
-        persistent_workers=args.num_workers > 0,
+        persistent_workers=True if args.num_workers > 0 else False,
+        prefetch_factor=4 if args.num_workers > 0 else None,
         worker_init_fn=seed_worker,
         generator=g,
         drop_last=False,
@@ -213,6 +240,9 @@ def train(args):
 
     model_cfg = build_model_config(args)
     model = make_model_from_config(model_cfg).to(device)
+
+    if hasattr(torch, "compile"):
+        model = torch.compile(model, mode="reduce-overhead")
     if distributed:
         model = DDP(
             model,
@@ -224,7 +254,11 @@ def train(args):
     ema = EMA(unwrap_model(model), decay=args.ema_decay, update_after_step=args.ema_update_after_step)
     diffusion = DiffusionSchedule(args.timesteps, schedule=args.beta_schedule).to(device)
 
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    opt = torch.optim.AdamW(
+        model.parameters(),
+        lr=args.lr,
+        fused=torch.cuda.is_available()
+    )
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, len(train_loader) * args.epochs))
     scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
 
@@ -247,6 +281,9 @@ def train(args):
                 print("[warning] CLI model args differ from checkpoint model_config. Using checkpoint config for safety.")
             model_cfg = ckpt_model_cfg
             new_model = make_model_from_config(model_cfg).to(device)
+
+            if hasattr(torch, "compile"):
+                new_model = torch.compile(new_model, mode="reduce-overhead")
             if distributed:
                 new_model = DDP(
                     new_model,
@@ -256,7 +293,11 @@ def train(args):
                 )
             model = new_model
             ema = EMA(unwrap_model(model), decay=args.ema_decay, update_after_step=args.ema_update_after_step)
-            opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
+            opt = torch.optim.AdamW(
+                model.parameters(),
+                lr=args.lr,
+                fused=torch.cuda.is_available()
+            )
             sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, len(train_loader) * args.epochs))
 
         unwrap_model(model).load_state_dict(ckpt["model_state_dict"])
@@ -286,7 +327,7 @@ def train(args):
         )
 
         for batch in pbar:
-            clip = batch["clip"].to(device, non_blocking=True)
+            clip = batch["clip"].to(device, non_blocking=True).contiguous(memory_format=torch.channels_last_3d)
             k = args.endpoint_context
             cond_start_ctx = clip[:, :, :k]
             cond_end_ctx = clip[:, :, -k:]
@@ -337,7 +378,7 @@ def train(args):
         val_losses = []
         with torch.no_grad():
             for batch in val_loader:
-                clip = batch["clip"].to(device, non_blocking=True)
+                clip = batch["clip"].to(device, non_blocking=True).contiguous(memory_format=torch.channels_last_3d)
                 k = args.endpoint_context
                 cond_start_ctx = clip[:, :, :k]
                 cond_end_ctx = clip[:, :, -k:]
@@ -394,7 +435,7 @@ def train(args):
             ema_model = ema.ema_model
             if (epoch + 1) % args.vis_every == 0 and fixed_idx is not None:
                 preview_sample = val_ds[fixed_idx]
-                preview_clip = preview_sample["clip"].unsqueeze(0).to(device)
+                preview_clip = preview_sample["clip"].unsqueeze(0).to(device).contiguous(memory_format=torch.channels_last_3d)
                 k = args.endpoint_context
                 preview_start_ctx = preview_clip[:, :, :k]
                 preview_end_ctx = preview_clip[:, :, -k:]
