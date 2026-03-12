@@ -237,6 +237,7 @@ Features:
 </p>
 
 *Training and validation loss curves during BAIR training. Both losses decrease steadily and remain closely aligned, indicating stable convergence without significant overfitting.*
+
 ---
 # Default Training Configuration
 
