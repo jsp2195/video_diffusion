@@ -232,6 +232,9 @@ Features:
 
 ## Training Behavior
 
+<p align="center">
+  <img src="training_curves.png" width="750">
+</p>
 
 *Training and validation loss curves during BAIR training. Both losses decrease steadily and remain closely aligned, indicating stable convergence without significant overfitting.*
 
