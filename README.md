@@ -230,8 +230,15 @@ Features:
 * temporal loss weighting
 * AMP mixed precision
 
----
+## Training Behavior
 
+<p align="center">
+  <img src="training_curves.png" width="750">
+</p>
+
+*Training and validation loss curves during BAIR training.*
+
+---
 # Default Training Configuration
 
 Designed for single GPU experiments.
