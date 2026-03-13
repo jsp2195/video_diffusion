@@ -1,4 +1,4 @@
-# Lightweight Multi-Endpoint-Context RGB Video Diffusion (PyTorch)
+# Lightweight Endpoint-Context RGB Video Diffusion (PyTorch)
 
 <p align="center">
   <img src="generated_BAIR_frames.png" width="900">
